@@ -422,6 +422,8 @@ class Processor:
 
         # Multimodal related.
         mm_features: Optional[list[MultiModalFeatureSpec]] = None
+        embedding_start_time: Optional[float] = None
+        embedding_end_time: Optional[float] = None
 
         if decoder_inputs["type"] == "multimodal":
             decoder_mm_inputs = decoder_inputs["mm_kwargs"]
@@ -442,6 +444,12 @@ class Processor:
                         identifier=decoder_mm_hashes[modality][idx],
                         mm_position=decoder_mm_positions[modality][idx]))
 
+            # If the preprocessor measured embedding time, propagate it.
+            embedding_start_time = getattr(self.input_preprocessor,
+                                           "_embedding_start_time", None)
+            embedding_end_time = getattr(self.input_preprocessor,
+                                        "_embedding_end_time", None)
+
         return prompt_str, EngineCoreRequest(
             request_id=request_id,
             prompt_token_ids=prompt_token_ids,
@@ -451,6 +459,8 @@ class Processor:
             pooling_params=pooling_params,
             eos_token_id=eos_token_id,
             arrival_time=arrival_time,
+            embedding_start_time=embedding_start_time,
+            embedding_end_time=embedding_end_time,
             lora_request=lora_request,
             cache_salt=decoder_inputs.get("cache_salt"),
             priority=priority,

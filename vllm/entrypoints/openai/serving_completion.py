@@ -5,7 +5,7 @@ import asyncio
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
-from typing import Optional, Union, cast
+from typing import List, Optional, Union, cast
 
 import jinja2
 from fastapi import Request
@@ -38,6 +38,7 @@ from vllm.logger import init_logger
 from vllm.logprobs import Logprob
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import BeamSearchParams, SamplingParams
+from vllm.sequence import RequestMetrics
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.utils import as_list, merge_async_iterators
 
@@ -508,7 +509,9 @@ class OpenAIServingCompletion(OpenAIServing):
         num_generated_tokens = 0
         kv_transfer_params = None
         last_final_res = None
+        metrics_list: List[RequestMetrics] = []
         for final_res in final_res_batch:
+            metrics_list.append(final_res.metrics)
             last_final_res = final_res
             prompt_token_ids = final_res.prompt_token_ids
             assert prompt_token_ids is not None
@@ -598,6 +601,7 @@ class OpenAIServingCompletion(OpenAIServing):
             model=model_name,
             choices=choices,
             usage=usage,
+            metrics_list=metrics_list,
             kv_transfer_params=kv_transfer_params,
         )
 
