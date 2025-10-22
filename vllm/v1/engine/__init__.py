@@ -69,7 +69,10 @@ class EngineCoreRequest(
     priority: int = 0
 
     trace_headers: Optional[Mapping[str, str]] = None
-
+    
+    # Duration (seconds) to obtain multimodal embeddings during preprocessing
+    embedding_start_time: Optional[float] = None
+    embedding_end_time: Optional[float] = None
 
 class EngineCoreEventType(enum.IntEnum):
     """The type of engine core request event."""

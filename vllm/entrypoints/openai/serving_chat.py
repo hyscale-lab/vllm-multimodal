@@ -47,6 +47,7 @@ from vllm.logprobs import Logprob
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.reasoning import ReasoningParser, ReasoningParserManager
 from vllm.sampling_params import BeamSearchParams, SamplingParams
+from vllm.sequence import RequestMetrics
 from vllm.transformers_utils.tokenizer import AnyTokenizer, MistralTokenizer
 from vllm.transformers_utils.tokenizers import (maybe_serialize_tool_calls,
                                                 truncate_tool_call_ids,
@@ -1161,10 +1162,13 @@ class OpenAIServingChat(OpenAIServing):
 
         created_time = int(time.time())
         final_res: Optional[RequestOutput] = None
+        metrics_list: list[RequestMetrics] = []
 
         try:
             async for res in result_generator:
                 final_res = res
+                if res.metrics is not None:
+                    metrics_list.append(res.metrics)
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
         except ValueError as e:
@@ -1418,6 +1422,7 @@ class OpenAIServingChat(OpenAIServing):
             model=model_name,
             choices=choices,
             usage=usage,
+            metrics_list=metrics_list,
             prompt_logprobs=clamp_prompt_logprobs(final_res.prompt_logprobs),
             prompt_token_ids=(final_res.prompt_token_ids
                               if request.return_token_ids else None),

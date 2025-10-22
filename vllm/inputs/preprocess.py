@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Mapping
+import time
 from typing import Any, Optional, Union, cast
 
 from typing_extensions import assert_never
@@ -39,6 +40,11 @@ class InputPreprocessor:
         self.tokenizer = tokenizer
         self.mm_registry = mm_registry
         self.mm_processor_cache = mm_processor_cache
+        
+        # Last measured wall-clock timestamp (seconds since epoch) when
+        # multimodal embeddings finished processing.
+        self._embedding_start_time: Optional[float] = None
+        self._embedding_end_time: Optional[float] = None
 
     def get_tokenizer(self) -> AnyTokenizer:
         if self.tokenizer is None:
@@ -239,6 +245,7 @@ class InputPreprocessor:
         if mm_processor_kwargs is None:
             mm_processor_kwargs = {}
 
+        self._embedding_start_time = time.time()
         mm_input = mm_processor.apply(
             prompt,
             mm_data,
@@ -246,6 +253,8 @@ class InputPreprocessor:
             tokenization_kwargs=tokenization_kwargs,
             mm_uuids=mm_uuids,
         )
+        # Record the end timestamp; duration can be computed downstream.
+        self._embedding_end_time = time.time()
         mm_hashes = mm_input["mm_hashes"]
 
         # Validate that all mm items have a string as their hash
@@ -627,6 +636,11 @@ class InputPreprocessor:
         mm_uuids: Optional[MultiModalUUIDDict] = None,
     ) -> ProcessorInputs:
         """Preprocess the input prompt."""
+
+        # Reset last measured embedding timestamp at the start of each request
+        self._embedding_start_time = None
+        self._embedding_end_time = None
+
         if self.model_config.is_encoder_decoder:
             # Encoder-decoder model requires special mapping of
             # input prompts to encoder & decoder.

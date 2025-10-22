@@ -6,7 +6,7 @@
 import json
 import time
 from http import HTTPStatus
-from typing import (Annotated, Any, ClassVar, Generic, Literal, Optional,
+from typing import (Annotated, Any, ClassVar, Generic, List, Literal, Optional,
                     TypeVar, Union)
 
 import regex as re
@@ -58,6 +58,7 @@ from vllm.logprobs import Logprob
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import (BeamSearchParams, RequestOutputKind,
                                   SamplingParams, StructuredOutputsParams)
+from vllm.sequence import RequestMetrics
 from vllm.utils import random_uuid, resolve_obj_by_qualname
 
 logger = init_logger(__name__)
@@ -1674,6 +1675,7 @@ class CompletionResponse(OpenAIBaseModel):
     usage: UsageInfo
 
     # vLLM-specific fields that are not in OpenAI spec
+    metrics_list: List[RequestMetrics]
     kv_transfer_params: Optional[dict[str, Any]] = Field(
         default=None, description="KVTransfer parameters.")
 
@@ -1884,6 +1886,7 @@ class ChatCompletionResponse(OpenAIBaseModel):
     # vLLM-specific fields that are not in OpenAI spec
     prompt_logprobs: Optional[list[Optional[dict[int, Logprob]]]] = None
     prompt_token_ids: Optional[list[int]] = None
+    metrics_list: List[RequestMetrics]
     kv_transfer_params: Optional[dict[str, Any]] = Field(
         default=None, description="KVTransfer parameters.")
 

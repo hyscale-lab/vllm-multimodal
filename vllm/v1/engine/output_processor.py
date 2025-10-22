@@ -4,13 +4,14 @@
 import asyncio
 from collections.abc import Iterable
 from dataclasses import dataclass
+import time
 from typing import Any, Optional, Union, cast
-
 import torch
 
 from vllm.outputs import (CompletionOutput, PoolingOutput,
                           PoolingRequestOutput, RequestOutput)
 from vllm.sampling_params import RequestOutputKind
+from vllm.sequence import RequestMetrics
 from vllm.tracing import (SpanAttributes, SpanKind, Tracer,
                           extract_trace_context)
 from vllm.transformers_utils.tokenizer import AnyTokenizer
@@ -95,6 +96,8 @@ class RequestState:
         arrival_time: float,
         queue: Optional[RequestOutputCollector],
         log_stats: bool,
+        embedding_start_time: Optional[float] = None,
+        embedding_end_time: Optional[float] = None,
         top_p: Optional[float] = None,
         n: Optional[int] = None,
         temperature: Optional[float] = None,
@@ -118,9 +121,15 @@ class RequestState:
         self.is_prefilling = True
         self.queue = queue
         self.num_cached_tokens = 0
+        self.embedding_start_time = embedding_start_time
+        self.embedding_end_time = embedding_end_time
 
         self.stats = RequestStateStats(
             arrival_time=arrival_time) if log_stats else None
+
+        # Offset to convert engine-core monotonic timestamps to wall clock
+        # timestamps: wall = monotonic + core_to_wall_offset
+        self.core_to_wall_offset: Optional[float] = None
 
     @classmethod
     def from_new_request(
@@ -179,6 +188,8 @@ class RequestState:
             arrival_time=request.arrival_time,
             queue=queue,
             log_stats=log_stats,
+            embedding_start_time=request.embedding_start_time,
+            embedding_end_time=request.embedding_end_time
         )
 
     def make_request_output(
@@ -248,6 +259,8 @@ class RequestState:
         if prompt_token_ids is None and self.prompt_embeds is not None:
             prompt_token_ids = [0] * len(self.prompt_embeds)
 
+        metrics = self._convert_stats_to_metrics() if finished else None
+
         return RequestOutput(
             request_id=request_id,
             prompt=self.prompt,
@@ -257,7 +270,30 @@ class RequestState:
             finished=finished,
             kv_transfer_params=kv_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
+            metrics=metrics
         )
+
+    def _convert_stats_to_metrics(self) -> RequestMetrics:
+        def _to_wall(ts: Optional[float]) -> Optional[float]:
+            if ts is None or ts == 0.0 or self.core_to_wall_offset is None:
+                return None
+            return ts + self.core_to_wall_offset
+
+        queued_time: Optional[float] = None
+        if self.stats.scheduled_ts and self.stats.queued_ts:
+            queued_time = self.stats.scheduled_ts - self.stats.queued_ts
+
+        metrics = RequestMetrics(
+            arrival_time=self.stats.arrival_time,
+            last_token_time=_to_wall(self.stats.last_token_ts),
+            first_scheduled_time=_to_wall(self.stats.scheduled_ts),
+            first_token_time=_to_wall(self.stats.first_token_ts),
+            time_in_queue=queued_time,
+            finished_time=time.time(),
+            embedding_start_time=self.embedding_start_time,
+            embedding_end_time=self.embedding_end_time
+        )
+        return metrics
 
     def _new_completion_output(
         self,
@@ -549,6 +585,10 @@ class OutputProcessor:
 
         assert engine_core_timestamp is not None
         assert req_state.stats is not None
+        # Capture conversion offset once per request: wall = mono + offset
+        if req_state.core_to_wall_offset is None:
+            req_state.core_to_wall_offset = (
+                iteration_stats.iteration_timestamp - engine_core_timestamp)
         iteration_stats.update_from_output(engine_core_output,
                                            engine_core_timestamp,
                                            req_state.is_prefilling,
