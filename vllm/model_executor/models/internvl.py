@@ -20,10 +20,14 @@ from PIL import Image
 from transformers import BatchEncoding, PretrainedConfig, TensorType
 
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.awq import AWQConfig
-from vllm.model_executor.models.intern_vit import (InternVisionModel,
-                                                   InternVisionPatchModel)
+from vllm.model_executor.models.intern_vit import (
+    InternVisionModel,
+    InternVisionPatchModel,
+    build_reuse_mask_from_embeddings,
+)
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.image import convert_image_mode
@@ -51,6 +55,8 @@ IMG_CONTEXT = '<IMG_CONTEXT>'
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+
+logger = init_logger(__name__)
 
 
 class InternVLImagePixelInputs(TensorSchema):
@@ -1152,6 +1158,138 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
             x = x.permute(0, 2, 1, 3).contiguous()
         return x
 
+    def _get_reuse_settings(self) -> dict[str, object]:
+        enabled = os.environ.get("VLLM_INTERNVL_REUSE", "0") == "1"
+        recompute_ratio = float(
+            os.environ.get("VLLM_INTERNVL_REUSE_RECOMPUTE_RATIO", "0.2"))
+        reuse_start_layer = int(
+            os.environ.get("VLLM_INTERNVL_REUSE_START_LAYER", "2"))
+        reuse_end_layer_env = int(
+            os.environ.get("VLLM_INTERNVL_REUSE_END_LAYER", "-1"))
+        reuse_end_layer = None if reuse_end_layer_env < 0 else reuse_end_layer_env
+        enable_images = os.environ.get("VLLM_INTERNVL_REUSE_IMAGES",
+                                       "0") == "1"
+        return {
+            "enabled": enabled,
+            "recompute_ratio": recompute_ratio,
+            "reuse_start_layer": reuse_start_layer,
+            "reuse_end_layer": reuse_end_layer,
+            "enable_images": enable_images,
+        }
+
+    def _compute_reuse_mask_with_codec(
+        self,
+        *,
+        num_tokens: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        """Placeholder for codec-derived reuse masks (SAD/MV/skip)."""
+        _ = num_tokens
+        _ = device
+        return None
+
+    def _extract_feature_with_reuse(
+        self,
+        pixel_values: torch.Tensor,
+        num_patches: torch.Tensor,
+    ) -> torch.Tensor:
+        settings = self._get_reuse_settings()
+        if not settings["enabled"]:
+            return self.extract_feature(pixel_values)
+
+        embeddings_fn = self.vision_model.get_input_embeddings()
+        all_embeddings = embeddings_fn(pixel_values)
+        num_layers = len(self.vision_model.encoder.layers)
+        debug = os.environ.get("VLLM_INTERNVL_REUSE_DEBUG", "0") == "1"
+
+        outputs: list[torch.Tensor] = []
+        offset = 0
+        for count in num_patches.tolist():
+            if count <= 0:
+                continue
+            seq_embeddings = all_embeddings[offset:offset + count]
+            reuse_cache: list[Optional[torch.Tensor]] = [None] * num_layers
+            prev_emb: Optional[torch.Tensor] = None
+            for frame_idx in range(count):
+                emb = seq_embeddings[frame_idx:frame_idx + 1]
+                if prev_emb is None:
+                    reuse_mask = torch.zeros(
+                        (1, emb.size(1)),
+                        dtype=torch.bool,
+                        device=emb.device,
+                    )
+                    if debug:
+                        logger.info(
+                            "InternVL reuse: frame=%s/%s first frame, "
+                            "all recompute (tokens=%s).",
+                            frame_idx,
+                            count - 1,
+                            emb.size(1),
+                        )
+                else:
+                    if debug:
+                        logger.info(
+                            "InternVL reuse: frame=%s/%s ref_frame=%s "
+                            "(previous frame).",
+                            frame_idx,
+                            count - 1,
+                            frame_idx - 1,
+                        )
+                    reuse_mask = build_reuse_mask_from_embeddings(
+                        emb,
+                        prev_emb,
+                        recompute_ratio=settings["recompute_ratio"],
+                        cls_index=0,
+                    )
+                    codec_mask = self._compute_reuse_mask_with_codec(
+                        num_tokens=emb.size(1),
+                        device=emb.device,
+                    )
+                    if codec_mask is not None:
+                        reuse_mask = codec_mask
+                    if debug:
+                        num_tokens = reuse_mask.numel()
+                        num_reuse = int(reuse_mask.sum().item())
+                        num_recompute = num_tokens - num_reuse
+                        reuse_ratio = num_reuse / max(1, num_tokens)
+                        logger.info(
+                            "InternVL reuse: frames=%s layer_range=%s-%s "
+                            "recompute_ratio=%.3f reuse_ratio=%.3f "
+                            "(reuse=%s, recompute=%s, tokens=%s)",
+                            count,
+                            settings["reuse_start_layer"],
+                            settings["reuse_end_layer"],
+                            settings["recompute_ratio"],
+                            reuse_ratio,
+                            num_reuse,
+                            num_recompute,
+                            num_tokens,
+                        )
+
+                vision_out = self.vision_model(
+                    pixel_embeds=emb,
+                    reuse_mask=reuse_mask,
+                    reuse_cache=reuse_cache,
+                    reuse_start_layer=settings["reuse_start_layer"],
+                    reuse_end_layer=settings["reuse_end_layer"],
+                )
+                vision_out = vision_out[:, 1:, :]
+                h = w = int(vision_out.shape[1]**0.5)
+                vision_out = vision_out.reshape(vision_out.shape[0], h, w, -1)
+                vision_out = self.pixel_shuffle(
+                    vision_out,
+                    scale_factor=self.downsample_ratio,
+                )
+                vision_out = vision_out.reshape(vision_out.shape[0], -1,
+                                                vision_out.shape[-1])
+                vision_out = self.mlp1(vision_out)
+                outputs.append(vision_out)
+                prev_emb = emb
+
+            offset += count
+
+        return torch.cat(outputs, dim=0)
+
     def extract_feature(self, pixel_values: torch.Tensor) -> torch.Tensor:
         vit_embeds = self.vision_model(pixel_values=pixel_values)
         vit_embeds = vit_embeds[:, 1:, :]
@@ -1263,7 +1401,15 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
 
         assert self.vision_model is not None
 
-        image_embeds = self.extract_feature(image_input["pixel_values_flat"])
+        settings = self._get_reuse_settings()
+        reuse_enabled = settings["enabled"] and (
+            image_input["type"] == "pixel_values_videos"
+            or settings["enable_images"])
+        if reuse_enabled:
+            image_embeds = self._extract_feature_with_reuse(
+                image_input["pixel_values_flat"], image_input["num_patches"])
+        else:
+            image_embeds = self.extract_feature(image_input["pixel_values_flat"])
 
         num_patches = image_input["num_patches"]
 
