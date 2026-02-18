@@ -15,6 +15,7 @@ from typing import Annotated, Any, Literal, Optional, TypeVar, Union
 import numpy.typing as npt
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.transforms as T
 from PIL import Image
 from transformers import BatchEncoding, PretrainedConfig, TensorType
@@ -26,7 +27,7 @@ from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.models.intern_vit import (
     InternVisionModel,
     InternVisionPatchModel,
-    build_reuse_mask_from_embeddings,
+    build_prune_mask_from_embeddings,
 )
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -57,6 +58,26 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 logger = init_logger(__name__)
+
+
+def _get_internvl_prune_settings() -> dict[str, object]:
+    enabled = (os.environ.get("VLLM_INTERNVL_PRUNE", "0") == "1"
+               or os.environ.get("VLLM_INTERNVL_REUSE", "0") == "1")
+    prune_ratio = float(
+        os.environ.get(
+            "VLLM_INTERNVL_PRUNE_RATIO",
+            os.environ.get("VLLM_INTERNVL_REUSE_RECOMPUTE_RATIO", "0.2"),
+        ))
+    enable_images = (os.environ.get("VLLM_INTERNVL_PRUNE_IMAGES", "0") == "1"
+                     or os.environ.get("VLLM_INTERNVL_REUSE_IMAGES", "0") == "1")
+    debug = (os.environ.get("VLLM_INTERNVL_PRUNE_DEBUG", "0") == "1"
+             or os.environ.get("VLLM_INTERNVL_REUSE_DEBUG", "0") == "1")
+    return {
+        "enabled": enabled,
+        "prune_ratio": prune_ratio,
+        "enable_images": enable_images,
+        "debug": debug,
+    }
 
 
 class InternVLImagePixelInputs(TensorSchema):
@@ -416,6 +437,14 @@ class BaseInternVLProcessor(ABC):
 
         return get_internvl_target_ratios(min_num, max_num)
 
+    def _get_pruned_tokens_per_frame(self) -> Optional[int]:
+        settings = _get_internvl_prune_settings()
+        if not settings["enabled"]:
+            return None
+        prune_ratio = float(settings["prune_ratio"])
+        prune_ratio = max(0.0, min(1.0, prune_ratio))
+        return max(0, int(round(self.num_image_token * prune_ratio)))
+
     def get_num_image_tokens(
         self,
         *,
@@ -671,11 +700,21 @@ class InternVLProcessor(BaseInternVLProcessor):
         num_patches: Optional[int] = None,
         video_context_token: str = IMG_CONTEXT,
     ) -> PromptUpdateDetails[str]:
-        repl_features = video_context_token * self.num_image_token
-        repl_features_with_sep = IMG_START + repl_features + IMG_END
-        # num_patches is equal to num_frames
+        if num_patches is None:
+            num_patches = 0
+
+        pruned_tokens = self._get_pruned_tokens_per_frame()
+        if pruned_tokens is None:
+            frame_token_counts = [self.num_image_token] * num_patches
+        else:
+            frame_token_counts = [self.num_image_token] + [
+                pruned_tokens for _ in range(max(num_patches - 1, 0))
+            ]
+
         repl_full = ''.join([
-            f'Frame{i+1}: {repl_features_with_sep}' for i in range(num_patches)
+            f'Frame{i+1}: {IMG_START}'
+            f'{video_context_token * count}{IMG_END}'
+            for i, count in enumerate(frame_token_counts)
         ])
 
         return PromptUpdateDetails.select_text(repl_full, video_context_token)
@@ -1158,49 +1197,65 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
             x = x.permute(0, 2, 1, 3).contiguous()
         return x
 
-    def _get_reuse_settings(self) -> dict[str, object]:
-        enabled = os.environ.get("VLLM_INTERNVL_REUSE", "0") == "1"
-        recompute_ratio = float(
-            os.environ.get("VLLM_INTERNVL_REUSE_RECOMPUTE_RATIO", "0.2"))
-        reuse_start_layer = int(
-            os.environ.get("VLLM_INTERNVL_REUSE_START_LAYER", "2"))
-        reuse_end_layer_env = int(
-            os.environ.get("VLLM_INTERNVL_REUSE_END_LAYER", "-1"))
-        reuse_end_layer = None if reuse_end_layer_env < 0 else reuse_end_layer_env
-        enable_images = os.environ.get("VLLM_INTERNVL_REUSE_IMAGES",
-                                       "0") == "1"
-        return {
-            "enabled": enabled,
-            "recompute_ratio": recompute_ratio,
-            "reuse_start_layer": reuse_start_layer,
-            "reuse_end_layer": reuse_end_layer,
-            "enable_images": enable_images,
-        }
+    def _get_prune_settings(self) -> dict[str, object]:
+        return _get_internvl_prune_settings()
 
-    def _compute_reuse_mask_with_codec(
+    def _compute_prune_mask_with_codec(
         self,
         *,
         num_tokens: int,
         device: torch.device,
     ) -> Optional[torch.Tensor]:
-        """Placeholder for codec-derived reuse masks (SAD/MV/skip)."""
+        """Placeholder for codec-derived prune masks (SAD/MV/skip)."""
         _ = num_tokens
         _ = device
         return None
 
-    def _extract_feature_with_reuse(
+    def _select_pruned_tokens(
+        self,
+        current: torch.Tensor,
+        reference: torch.Tensor,
+        *,
+        prune_ratio: float,
+    ) -> torch.Tensor:
+        if current.shape != reference.shape:
+            raise ValueError("Prune reference shape mismatch.")
+
+        if prune_ratio >= 1.0:
+            return current
+        if prune_ratio <= 0.0:
+            return current[:, :0, :]
+
+        batch_size, num_tokens, hidden_size = current.shape
+        retain = int(round(num_tokens * prune_ratio))
+        retain = max(0, min(num_tokens, retain))
+        if retain == num_tokens:
+            return current
+        if retain == 0:
+            return current[:, :0, :]
+
+        current_norm = F.normalize(current, dim=-1)
+        reference_norm = F.normalize(reference, dim=-1)
+        similarity = (current_norm * reference_norm).sum(dim=-1)
+        _, indices = torch.topk(similarity, k=retain, dim=-1, largest=False)
+        gather_idx = indices.unsqueeze(-1).expand(batch_size, retain,
+                                                  hidden_size)
+        return torch.gather(current, dim=1, index=gather_idx)
+
+
+    def _extract_feature_with_prune(
         self,
         pixel_values: torch.Tensor,
         num_patches: torch.Tensor,
-    ) -> torch.Tensor:
-        settings = self._get_reuse_settings()
+    ) -> list[torch.Tensor]:
+        settings = self._get_prune_settings()
         if not settings["enabled"]:
             return self.extract_feature(pixel_values)
 
         embeddings_fn = self.vision_model.get_input_embeddings()
         all_embeddings = embeddings_fn(pixel_values)
         num_layers = len(self.vision_model.encoder.layers)
-        debug = os.environ.get("VLLM_INTERNVL_REUSE_DEBUG", "0") == "1"
+        debug = bool(settings.get("debug", False))
 
         outputs: list[torch.Tensor] = []
         offset = 0
@@ -1208,71 +1263,85 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
             if count <= 0:
                 continue
             seq_embeddings = all_embeddings[offset:offset + count]
-            reuse_cache: list[Optional[torch.Tensor]] = [None] * num_layers
-            prev_emb: Optional[torch.Tensor] = None
+            key_cache: list[Optional[torch.Tensor]] = [None] * num_layers
+            key_emb: Optional[torch.Tensor] = None
+            key_out: Optional[torch.Tensor] = None
+            key_encoder_out: Optional[torch.Tensor] = None
             for frame_idx in range(count):
                 emb = seq_embeddings[frame_idx:frame_idx + 1]
-                if prev_emb is None:
-                    reuse_mask = torch.zeros(
+                if frame_idx == 0:
+                    key_emb = emb
+                    prune_mask = torch.zeros(
                         (1, emb.size(1)),
                         dtype=torch.bool,
                         device=emb.device,
                     )
+                    prune_update_cache = True
                     if debug:
                         logger.info(
-                            "InternVL reuse: frame=%s/%s first frame, "
+                            "InternVL prune: frame=%s/%s key frame, "
                             "all recompute (tokens=%s).",
                             frame_idx,
                             count - 1,
                             emb.size(1),
                         )
                 else:
+                    assert key_emb is not None
                     if debug:
                         logger.info(
-                            "InternVL reuse: frame=%s/%s ref_frame=%s "
-                            "(previous frame).",
+                            "InternVL prune: frame=%s/%s ref_frame=%s "
+                            "(key frame).",
                             frame_idx,
                             count - 1,
-                            frame_idx - 1,
+                            0,
                         )
-                    reuse_mask = build_reuse_mask_from_embeddings(
+                    prune_mask = build_prune_mask_from_embeddings(
                         emb,
-                        prev_emb,
-                        recompute_ratio=settings["recompute_ratio"],
+                        key_emb,
+                        prune_ratio=settings["prune_ratio"],
                         cls_index=0,
                     )
-                    codec_mask = self._compute_reuse_mask_with_codec(
+                    codec_mask = self._compute_prune_mask_with_codec(
                         num_tokens=emb.size(1),
                         device=emb.device,
                     )
                     if codec_mask is not None:
-                        reuse_mask = codec_mask
+                        prune_mask = codec_mask
+                    prune_update_cache = False
                     if debug:
-                        num_tokens = reuse_mask.numel()
-                        num_reuse = int(reuse_mask.sum().item())
-                        num_recompute = num_tokens - num_reuse
-                        reuse_ratio = num_reuse / max(1, num_tokens)
+                        num_tokens = prune_mask.numel()
+                        num_skip = int(prune_mask.sum().item())
+                        num_recompute = num_tokens - num_skip
+                        skip_ratio = num_skip / max(1, num_tokens)
                         logger.info(
-                            "InternVL reuse: frames=%s layer_range=%s-%s "
-                            "recompute_ratio=%.3f reuse_ratio=%.3f "
-                            "(reuse=%s, recompute=%s, tokens=%s)",
+                            "InternVL prune: frames=%s "
+                            "prune_ratio=%.3f skip_ratio=%.3f "
+                            "(skip=%s, recompute=%s, tokens=%s)",
                             count,
-                            settings["reuse_start_layer"],
-                            settings["reuse_end_layer"],
-                            settings["recompute_ratio"],
-                            reuse_ratio,
-                            num_reuse,
+                            settings["prune_ratio"],
+                            skip_ratio,
+                            num_skip,
                             num_recompute,
                             num_tokens,
                         )
 
                 vision_out = self.vision_model(
                     pixel_embeds=emb,
-                    reuse_mask=reuse_mask,
-                    reuse_cache=reuse_cache,
-                    reuse_start_layer=settings["reuse_start_layer"],
-                    reuse_end_layer=settings["reuse_end_layer"],
+                    prune_mask=prune_mask,
+                    prune_cache=key_cache,
+                    prune_update_cache=prune_update_cache,
                 )
+                if frame_idx == 0:
+                    key_encoder_out = vision_out
+                else:
+                    assert key_encoder_out is not None
+                    dynamic_idx = (~prune_mask[0]).nonzero(
+                        as_tuple=False).squeeze(-1)
+                    full_encoder_out = key_encoder_out.clone()
+                    if dynamic_idx.numel() > 0:
+                        full_encoder_out.index_copy_(1, dynamic_idx,
+                                                     vision_out)
+                    vision_out = full_encoder_out
                 vision_out = vision_out[:, 1:, :]
                 h = w = int(vision_out.shape[1]**0.5)
                 vision_out = vision_out.reshape(vision_out.shape[0], h, w, -1)
@@ -1283,12 +1352,21 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
                 vision_out = vision_out.reshape(vision_out.shape[0], -1,
                                                 vision_out.shape[-1])
                 vision_out = self.mlp1(vision_out)
-                outputs.append(vision_out)
-                prev_emb = emb
+                if frame_idx == 0:
+                    key_out = vision_out
+                    outputs.append(vision_out.squeeze(0))
+                else:
+                    assert key_out is not None
+                    pruned_out = self._select_pruned_tokens(
+                        vision_out,
+                        key_out,
+                        prune_ratio=settings["prune_ratio"],
+                    )
+                    outputs.append(pruned_out.squeeze(0))
 
             offset += count
 
-        return torch.cat(outputs, dim=0)
+        return outputs
 
     def extract_feature(self, pixel_values: torch.Tensor) -> torch.Tensor:
         vit_embeds = self.vision_model(pixel_values=pixel_values)
@@ -1401,17 +1479,29 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
 
         assert self.vision_model is not None
 
-        settings = self._get_reuse_settings()
-        reuse_enabled = settings["enabled"] and (
+        settings = self._get_prune_settings()
+        prune_enabled = settings["enabled"] and (
             image_input["type"] == "pixel_values_videos"
             or settings["enable_images"])
-        if reuse_enabled:
-            image_embeds = self._extract_feature_with_reuse(
+        if prune_enabled:
+            image_embeds = self._extract_feature_with_prune(
                 image_input["pixel_values_flat"], image_input["num_patches"])
         else:
             image_embeds = self.extract_feature(image_input["pixel_values_flat"])
 
         num_patches = image_input["num_patches"]
+
+        if isinstance(image_embeds, list):
+            num_patches_list = num_patches.tolist()
+            grouped: list[torch.Tensor] = []
+            offset = 0
+            for count in num_patches_list:
+                if count <= 0:
+                    continue
+                frames = image_embeds[offset:offset + count]
+                grouped.append(torch.cat(frames, dim=0))
+                offset += count
+            return tuple(grouped)
 
         # Only one image in the current batch
         if len(num_patches) == 1:

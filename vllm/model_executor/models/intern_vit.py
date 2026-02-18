@@ -41,30 +41,30 @@ NORM2FN = {
 }
 
 
-def build_reuse_mask_from_embeddings(
+def build_prune_mask_from_embeddings(
     embeddings: torch.Tensor,
     prev_embeddings: torch.Tensor,
     *,
-    recompute_ratio: float,
+    prune_ratio: float,
     cls_index: int = 0,
 ) -> torch.Tensor:
     """
-    Build a boolean reuse mask from input embeddings.
-    True means "reuse/skip", False means "recompute". CLS is always recompute.
+    Build a boolean prune mask from input embeddings.
+    True means "prune/skip", False means "recompute". CLS is always recompute.
     """
     if embeddings.ndim == 2:
         embeddings = embeddings.unsqueeze(0)
         prev_embeddings = prev_embeddings.unsqueeze(0)
 
     if embeddings.shape != prev_embeddings.shape:
-        raise ValueError("Embeddings shape mismatch for reuse mask.")
+        raise ValueError("Embeddings shape mismatch for prune mask.")
 
     batch_size, num_tokens, _ = embeddings.shape
     if num_tokens <= 1:
         return torch.zeros_like(embeddings[:, :, 0], dtype=torch.bool)
 
-    if not (0.0 <= recompute_ratio <= 1.0):
-        raise ValueError("recompute_ratio must be within [0, 1].")
+    if not (0.0 <= prune_ratio <= 1.0):
+        raise ValueError("prune_ratio must be within [0, 1].")
 
     token_mask = torch.ones(num_tokens,
                             dtype=torch.bool,
@@ -77,18 +77,18 @@ def build_reuse_mask_from_embeddings(
     similarity = (curr * prev).sum(dim=-1)  # [B, N-1]
     debug = os.environ.get("VLLM_INTERNVL_REUSE_DEBUG", "0") == "1"
 
-    recompute_count = int(round((num_tokens - 1) * recompute_ratio))
+    recompute_count = int(round((num_tokens - 1) * prune_ratio))
     recompute_count = max(0, min(num_tokens - 1, recompute_count))
 
-    reuse_mask = torch.ones((batch_size, num_tokens),
+    prune_mask = torch.ones((batch_size, num_tokens),
                             dtype=torch.bool,
                             device=embeddings.device)
-    reuse_mask[:, cls_index] = False
+    prune_mask[:, cls_index] = False
 
     if debug:
         sim0 = similarity[0]
         logger.info(
-            "InternVL reuse similarity: tokens=%s cls_index=%s "
+            "InternVL prune similarity: tokens=%s cls_index=%s "
             "recompute_count=%s sim[min/mean/max]=%.4f/%.4f/%.4f",
             num_tokens,
             cls_index,
@@ -99,7 +99,7 @@ def build_reuse_mask_from_embeddings(
         )
 
     if recompute_count == 0:
-        return reuse_mask
+        return prune_mask
 
     _, recompute_idx = torch.topk(similarity,
                                   k=recompute_count,
@@ -110,37 +110,37 @@ def build_reuse_mask_from_embeddings(
         recompute_idx = recompute_idx + 1
 
     for batch_idx in range(batch_size):
-        reuse_mask[batch_idx, recompute_idx[batch_idx]] = False
+        prune_mask[batch_idx, recompute_idx[batch_idx]] = False
 
-    return reuse_mask
+    return prune_mask
 
 
-def apply_block_sparse_layer(
+def apply_pruned_layer(
     layer: "InternVisionEncoderLayer",
     hidden_states: torch.Tensor,
     *,
-    reuse_mask: torch.Tensor,
+    prune_mask: torch.Tensor,
     cache: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    """Apply a block-sparse attention+FFN path with token reuse.
+    """Apply a block-sparse attention+FFN path with pruning.
 
-    Tokens with reuse_mask=True are copied from cache; others are recomputed.
+    Tokens with prune_mask=True are copied from cache; others are recomputed.
     This is an aggressive approximation for experimental use.
     """
     if cache is None:
         return layer(hidden_states)
 
-    if reuse_mask.ndim == 1:
-        reuse_mask = reuse_mask.unsqueeze(0).expand(hidden_states.size(0), -1)
+    if prune_mask.ndim == 1:
+        prune_mask = prune_mask.unsqueeze(0).expand(hidden_states.size(0), -1)
 
-    if reuse_mask.shape[:2] != hidden_states.shape[:2]:
-        raise ValueError("reuse_mask shape must match hidden_states.")
+    if prune_mask.shape[:2] != hidden_states.shape[:2]:
+        raise ValueError("prune_mask shape must match hidden_states.")
 
     batch_size, num_tokens, _ = hidden_states.shape
     outputs = cache.clone()
 
     for batch_idx in range(batch_size):
-        recompute_mask = ~reuse_mask[batch_idx]
+        recompute_mask = ~prune_mask[batch_idx]
         if not torch.any(recompute_mask):
             continue
 
@@ -233,10 +233,9 @@ class InternVisionPatchModel(nn.Module):
         pixel_values: Optional[torch.Tensor] = None,
         pixel_embeds: Optional[torch.Tensor] = None,
         *,
-        reuse_mask: Optional[torch.Tensor] = None,
-        reuse_cache: Optional[list[Optional[torch.Tensor]]] = None,
-        reuse_start_layer: int = 2,
-        reuse_end_layer: Optional[int] = None,
+        prune_mask: Optional[torch.Tensor] = None,
+        prune_cache: Optional[list[Optional[torch.Tensor]]] = None,
+        prune_update_cache: bool = True,
     ) -> torch.FloatTensor:
         if pixel_values is None and pixel_embeds is None:
             raise ValueError(
@@ -342,6 +341,25 @@ class InternParallelAttention(nn.Module):
             q, k = self._apply_qk_norm(q, k)
 
         out = self.attn(q, k, v)
+        out, _ = self.proj(out)
+        return out
+
+    def forward_pruned(
+        self,
+        normed_full_hidden: torch.Tensor,
+        q_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        if q_indices.numel() == 0:
+            return normed_full_hidden[:, :0, :]
+
+        qkv, _ = self.qkv(normed_full_hidden)
+        q_full, k_full, v_full = qkv.chunk(3, dim=-1)
+
+        if self.qk_normalization:
+            q_full, k_full = self._apply_qk_norm(q_full, k_full)
+
+        q_dyn = q_full.index_select(1, q_indices)
+        out = self.attn(q_dyn, k_full, v_full)
         out, _ = self.proj(out)
         return out
 
@@ -488,46 +506,71 @@ class InternVisionEncoder(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         *,
-        reuse_mask: Optional[torch.Tensor] = None,
-        reuse_cache: Optional[list[Optional[torch.Tensor]]] = None,
-        reuse_start_layer: int = 2,
-        reuse_end_layer: Optional[int] = None,
+        prune_mask: Optional[torch.Tensor] = None,
+        prune_cache: Optional[list[Optional[torch.Tensor]]] = None,
+        prune_update_cache: bool = True,
     ):
         hidden_states = inputs_embeds
-        if reuse_mask is None or reuse_cache is None:
+        if prune_mask is None or prune_cache is None:
             for encoder_layer in self.layers:
                 hidden_states = encoder_layer(hidden_states)
             return hidden_states
 
         num_layers = len(self.layers)
-        if reuse_end_layer is None:
-            reuse_end_layer = max(num_layers - 1, 0)
-        if len(reuse_cache) != num_layers:
-            raise ValueError("reuse_cache length must match encoder layers.")
-        debug = os.environ.get("VLLM_INTERNVL_REUSE_DEBUG", "0") == "1"
+        if len(prune_cache) != num_layers:
+            raise ValueError("prune_cache length must match encoder layers.")
+        debug = os.environ.get("VLLM_INTERNVL_PRUNE_DEBUG", "0") == "1"
         if debug:
             logger.info(
-                "InternVL reuse layers: start=%s end=%s (exclusive) total=%s",
-                reuse_start_layer,
-                reuse_end_layer,
+                "InternVL prune layers: total=%s",
                 num_layers,
             )
 
-        for layer_idx, encoder_layer in enumerate(self.layers):
-            if layer_idx < reuse_start_layer or layer_idx >= reuse_end_layer:
-                hidden_states = encoder_layer(hidden_states)
-            else:
+        if prune_mask.ndim == 1:
+            prune_mask = prune_mask.unsqueeze(0)
+
+        if prune_update_cache:
+            for layer_idx, encoder_layer in enumerate(self.layers):
                 if debug:
-                    cache_state = "hit" if reuse_cache[layer_idx] is not None else "miss"
-                    logger.info("InternVL reuse layer=%s cache=%s", layer_idx,
+                    cache_state = "hit" if prune_cache[
+                        layer_idx] is not None else "miss"
+                    logger.info("InternVL prune layer=%s cache=%s", layer_idx,
                                 cache_state)
-                hidden_states = apply_block_sparse_layer(
+                hidden_states = apply_pruned_layer(
                     encoder_layer,
                     hidden_states,
-                    reuse_mask=reuse_mask,
-                    cache=reuse_cache[layer_idx],
+                    prune_mask=prune_mask,
+                    cache=prune_cache[layer_idx],
                 )
-            reuse_cache[layer_idx] = hidden_states
+                prune_cache[layer_idx] = hidden_states
+            return hidden_states
+
+        if prune_mask.shape[0] > 1 and not torch.equal(
+                prune_mask, prune_mask[0:1].expand_as(prune_mask)):
+            raise NotImplementedError(
+                "Per-example prune masks are not supported with compact "
+                "hidden states.")
+
+        dynamic_idx = (~prune_mask[0]).nonzero(as_tuple=False).squeeze(-1)
+        if dynamic_idx.numel() == 0:
+            return hidden_states[:, :0, :]
+
+        hidden_states = hidden_states.index_select(1, dynamic_idx)
+        for layer_idx, encoder_layer in enumerate(self.layers):
+            cache = prune_cache[layer_idx]
+            if cache is None:
+                raise ValueError(
+                    "Prune cache is missing for compact pruning.")
+
+            full_hidden = cache.clone()
+            full_hidden.index_copy_(1, dynamic_idx, hidden_states)
+            normed_full = encoder_layer.norm1(full_hidden)
+            attn_out = encoder_layer.attn.forward_pruned(
+                normed_full, dynamic_idx) * encoder_layer.ls1
+            hidden_states = hidden_states + attn_out
+            mlp_out = encoder_layer.mlp(
+                encoder_layer.norm2(hidden_states)) * encoder_layer.ls2
+            hidden_states = hidden_states + mlp_out
 
         return hidden_states
 
@@ -571,10 +614,9 @@ class InternVisionModel(nn.Module):
         pixel_values: Optional[torch.Tensor] = None,
         pixel_embeds: Optional[torch.Tensor] = None,
         *,
-        reuse_mask: Optional[torch.Tensor] = None,
-        reuse_cache: Optional[list[Optional[torch.Tensor]]] = None,
-        reuse_start_layer: int = 2,
-        reuse_end_layer: Optional[int] = None,
+        prune_mask: Optional[torch.Tensor] = None,
+        prune_cache: Optional[list[Optional[torch.Tensor]]] = None,
+        prune_update_cache: bool = True,
     ) -> torch.FloatTensor:
         if pixel_values is None and pixel_embeds is None:
             raise ValueError(
@@ -590,18 +632,17 @@ class InternVisionModel(nn.Module):
                     f'wrong pixel_values size: {pixel_values.shape}')
 
         if self.use_data_parallel:
-            if reuse_mask is not None:
+            if prune_mask is not None:
                 raise NotImplementedError(
-                    "Reuse is not supported with data-parallel sharding.")
+                    "Pruning is not supported with data-parallel sharding.")
             encoder_outputs = run_dp_sharded_vision_model(
                 hidden_states, self.encoder)
         else:
             encoder_outputs = self.encoder(
                 inputs_embeds=hidden_states,
-                reuse_mask=reuse_mask,
-                reuse_cache=reuse_cache,
-                reuse_start_layer=reuse_start_layer,
-                reuse_end_layer=reuse_end_layer,
+                prune_mask=prune_mask,
+                prune_cache=prune_cache,
+                prune_update_cache=prune_update_cache,
             )
 
         return encoder_outputs
