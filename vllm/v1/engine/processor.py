@@ -448,7 +448,7 @@ class Processor:
             embedding_start_time = getattr(self.input_preprocessor,
                                            "_embedding_start_time", None)
             embedding_end_time = getattr(self.input_preprocessor,
-                                        "_embedding_end_time", None)
+                                         "_embedding_end_time", None)
 
         return prompt_str, EngineCoreRequest(
             request_id=request_id,

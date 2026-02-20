@@ -1537,13 +1537,18 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         return mm_kwargs, mm_hashes_pos
 
-    def _execute_mm_encoder(self, scheduler_output: "SchedulerOutput"):
+    def _execute_mm_encoder(
+            self, scheduler_output: "SchedulerOutput") -> Optional[float]:
         # Batch the multi-modal inputs using the helper method.
         mm_kwargs, mm_hashes_pos = self._batch_mm_kwargs_from_scheduler(
             scheduler_output)
 
         if not mm_kwargs:
-            return
+            return None
+
+        mm_encoder_start = torch.cuda.Event(enable_timing=True)
+        mm_encoder_end = torch.cuda.Event(enable_timing=True)
+        mm_encoder_start.record()
 
         # Batch mm inputs as much as we can: if a request in the batch has
         # multiple modalities or a different modality than the previous one,
@@ -1602,6 +1607,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 output,
                 is_embed=pos_info.is_embed,
             )
+        mm_encoder_end.record()
+        mm_encoder_end.synchronize()
+        return mm_encoder_start.elapsed_time(mm_encoder_end)
 
     def _gather_mm_embeddings(
         self,
@@ -1951,7 +1959,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         num_tokens_after_padding: Optional[torch.Tensor] = None,
     ) -> tuple[int, int, Optional[torch.Tensor], Optional[torch.Tensor],
                Optional[torch.Tensor], torch.Tensor,
-               Optional[IntermediateTensors], dict[str, Any]]:
+               Optional[IntermediateTensors], dict[str, Any],
+               Optional[float]]:
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         if ubatch_slices:
@@ -1966,10 +1975,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # _prepare_inputs may reorder the batch, so we must gather multi
         # modal outputs after that to ensure the correct order
+        mm_encoder_latency_ms: Optional[float] = None
         if (self.supports_mm_inputs and get_pp_group().is_first_rank
                 and not self.model_config.is_encoder_decoder):
             # Run the multimodal encoder if any.
-            self._execute_mm_encoder(scheduler_output)
+            mm_encoder_latency_ms = self._execute_mm_encoder(scheduler_output)
             mm_embeds = self._gather_mm_embeddings(scheduler_output)
 
             # NOTE(woosuk): To unify token ids and soft tokens (vision
@@ -2049,6 +2059,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             positions,
             intermediate_tensors,
             model_kwargs,
+            mm_encoder_latency_ms,
         )
 
     def _sample(
@@ -2265,6 +2276,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 positions,
                 intermediate_tensors,
                 model_kwargs,
+                mm_encoder_latency_ms,
             ) = self._preprocess(scheduler_output, intermediate_tensors,
                                  ubatch_slices, num_tokens_after_padding)
 
@@ -2281,6 +2293,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # where it wants `num_tokens_across_dp` to align with `num_tokens`
         if ubatch_slices is not None:
             num_input_tokens = ubatch_slices[0].num_tokens
+        prefill_req_ids = [
+            req_id for req_id in self.input_batch.req_ids
+            if not self.requests[req_id].output_token_ids
+        ]
+        decoder_prefill_latency_ms: Optional[float] = None
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -2295,6 +2312,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         ), record_function_or_nullcontext("Forward"),
               self.maybe_get_kv_connector_output(scheduler_output) as
               kv_connector_output):
+            prefill_forward_start = None
+            prefill_forward_end = None
+            if prefill_req_ids:
+                prefill_forward_start = torch.cuda.Event(enable_timing=True)
+                prefill_forward_end = torch.cuda.Event(enable_timing=True)
+                prefill_forward_start.record()
             model_output = self.model(
                 input_ids=input_ids,
                 positions=positions,
@@ -2302,6 +2325,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            if prefill_forward_start is not None and \
+                    prefill_forward_end is not None:
+                prefill_forward_end.record()
+                prefill_forward_end.synchronize()
+                decoder_prefill_latency_ms = prefill_forward_start.elapsed_time(
+                    prefill_forward_end)
 
         with record_function_or_nullcontext("Postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -2423,6 +2452,20 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         with record_function_or_nullcontext("EPLB"):
             self.eplb_step()
 
+        mm_encoder_latency_by_req = None
+        if mm_encoder_latency_ms is not None and \
+                scheduler_output.scheduled_encoder_inputs:
+            mm_encoder_latency_by_req = {
+                req_id: mm_encoder_latency_ms
+                for req_id in scheduler_output.scheduled_encoder_inputs
+            }
+        decoder_prefill_latency_by_req = None
+        if decoder_prefill_latency_ms is not None and prefill_req_ids:
+            decoder_prefill_latency_by_req = {
+                req_id: decoder_prefill_latency_ms
+                for req_id in prefill_req_ids
+            }
+
         output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
@@ -2432,6 +2475,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             pooler_output=[],
             kv_connector_output=kv_connector_output,
             num_nans_in_logits=num_nans_in_logits,
+            mm_encoder_latency_ms=mm_encoder_latency_by_req,
+            decoder_prefill_latency_ms=decoder_prefill_latency_by_req,
         )
 
         if not self.use_async_scheduling:

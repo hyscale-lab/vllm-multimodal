@@ -127,6 +127,10 @@ class ModelRunnerOutput:
 
     # req_id -> num_nans_in_logits
     num_nans_in_logits: Optional[dict[str, int]] = None
+    # req_id -> mm encoder latency in milliseconds
+    mm_encoder_latency_ms: Optional[dict[str, float]] = None
+    # req_id -> decoder prefill forward latency in milliseconds
+    decoder_prefill_latency_ms: Optional[dict[str, float]] = None
 
 
 # ModelRunnerOutput wrapper for async scheduling.

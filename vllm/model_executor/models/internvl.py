@@ -72,11 +72,14 @@ def _get_internvl_prune_settings() -> dict[str, object]:
                      or os.environ.get("VLLM_INTERNVL_REUSE_IMAGES", "0") == "1")
     debug = (os.environ.get("VLLM_INTERNVL_PRUNE_DEBUG", "0") == "1"
              or os.environ.get("VLLM_INTERNVL_REUSE_DEBUG", "0") == "1")
+    disable_batching = (
+        os.environ.get("VLLM_INTERNVL_DISABLE_BATCHING", "0") == "1")
     return {
         "enabled": enabled,
         "prune_ratio": prune_ratio,
         "enable_images": enable_images,
         "debug": debug,
+        "disable_batching": disable_batching,
     }
 
 
@@ -1368,8 +1371,7 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
 
         return outputs
 
-    def extract_feature(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        vit_embeds = self.vision_model(pixel_values=pixel_values)
+    def _project_vit_embeddings(self, vit_embeds: torch.Tensor) -> torch.Tensor:
         vit_embeds = vit_embeds[:, 1:, :]
 
         h = w = int(vit_embeds.shape[1]**0.5)
@@ -1378,8 +1380,32 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
                                         scale_factor=self.downsample_ratio)
         vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1,
                                         vit_embeds.shape[-1])
-        vit_embeds = self.mlp1(vit_embeds)
-        return vit_embeds
+        return self.mlp1(vit_embeds)
+
+    def extract_feature(
+        self,
+        pixel_values: torch.Tensor,
+        num_patches: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        disable_batching = bool(self._get_prune_settings()["disable_batching"])
+        if (not disable_batching) or num_patches is None:
+            vit_embeds = self.vision_model(pixel_values=pixel_values)
+            return self._project_vit_embeddings(vit_embeds)
+
+        outputs: list[torch.Tensor] = []
+        offset = 0
+        for count in num_patches.tolist():
+            if count <= 0:
+                continue
+            item_pixel_values = pixel_values[offset:offset + count]
+            item_vit_embeds = self.vision_model(pixel_values=item_pixel_values)
+            outputs.append(self._project_vit_embeddings(item_vit_embeds))
+            offset += count
+
+        if not outputs:
+            return self._project_vit_embeddings(
+                self.vision_model(pixel_values=pixel_values[:0]))
+        return torch.cat(outputs, dim=0)
 
     def _parse_and_validate_image_input(
             self, **kwargs: object) -> Optional[InternVLImageInputs]:
@@ -1487,7 +1513,8 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
             image_embeds = self._extract_feature_with_prune(
                 image_input["pixel_values_flat"], image_input["num_patches"])
         else:
-            image_embeds = self.extract_feature(image_input["pixel_values_flat"])
+            image_embeds = self.extract_feature(image_input["pixel_values_flat"],
+                                                image_input["num_patches"])
 
         num_patches = image_input["num_patches"]
 

@@ -35,8 +35,11 @@ class RequestMetrics:
         model_execute_time: The time spent in the model execute function. This
                             will include model forward, block/sync across
                             workers, cpu-gpu sync time and sampling time.
-        embedding_start_time: The time when the embedding started.
-        embedding_end_time: The time when the embedding ended.
+        embedding_start_time: The time when MM embedding started.
+        embedding_end_time: The time when MM embedding ended.
+        mm_encoder_latency_ms: MM encoder execution time in milliseconds.
+        decoder_prefill_latency_ms: Decoder prefill forward time in
+                                    milliseconds.
     """
     arrival_time: float
     last_token_time: float
@@ -49,6 +52,8 @@ class RequestMetrics:
     model_execute_time: Optional[float] = None
     embedding_start_time: Optional[float] = None
     embedding_end_time: Optional[float] = None
+    mm_encoder_latency_ms: Optional[float] = None
+    decoder_prefill_latency_ms: Optional[float] = None
 
 # cannot use msgspec.Struct here because Dynamo does not support it
 @dataclass

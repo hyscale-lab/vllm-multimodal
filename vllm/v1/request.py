@@ -99,6 +99,9 @@ class Request:
         self.mm_features = mm_features or []
         self.num_encoder_inputs = len(self.mm_features)
         self.has_encoder_inputs = self.num_encoder_inputs > 0
+        # Persist first-seen per-request MM encoder latency so it can be
+        # reported even if the step with MM encoding emits no output.
+        self.mm_encoder_latency_ms: Optional[float] = None
 
         # Read-only views
         # Prevent directly appending to these lists since

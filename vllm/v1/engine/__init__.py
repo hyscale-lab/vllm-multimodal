@@ -117,6 +117,8 @@ class EngineCoreOutput(
     stop_reason: Union[int, str, None] = None
     events: Optional[list[EngineCoreEvent]] = None
     kv_transfer_params: Optional[dict[str, Any]] = None
+    mm_encoder_latency_ms: Optional[float] = None
+    decoder_prefill_latency_ms: Optional[float] = None
 
     trace_headers: Optional[Mapping[str, str]] = None
     # The number of tokens with prefix cache hits.

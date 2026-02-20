@@ -870,6 +870,9 @@ class Scheduler(SchedulerInterface):
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
+        mm_encoder_latency_ms = model_runner_output.mm_encoder_latency_ms or {}
+        decoder_prefill_latency_ms = (
+            model_runner_output.decoder_prefill_latency_ms or {})
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: Optional[SpecDecodingStats] = None
@@ -893,6 +896,26 @@ class Scheduler(SchedulerInterface):
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = sampled_token_ids[
                 req_index] if sampled_token_ids else []
+            # Persist MM encoder latency for this request even if this step
+            # does not emit an EngineCoreOutput.
+            req_mm_latency_ms = getattr(request, "mm_encoder_latency_ms", None)
+            step_mm_latency_ms = mm_encoder_latency_ms.get(req_id)
+            if step_mm_latency_ms is not None:
+                req_mm_latency_ms = ((req_mm_latency_ms or 0.0) +
+                                     step_mm_latency_ms)
+                setattr(request, "mm_encoder_latency_ms", req_mm_latency_ms)
+            # Accumulate decoder prefill latency across all prefill steps for
+            # this request so chunked prefill can be reported as a total.
+            req_decoder_prefill_latency_ms = getattr(
+                request, "decoder_prefill_latency_ms", None)
+            step_decoder_prefill_latency_ms = decoder_prefill_latency_ms.get(
+                req_id)
+            if step_decoder_prefill_latency_ms is not None:
+                req_decoder_prefill_latency_ms = (
+                    (req_decoder_prefill_latency_ms or 0.0) +
+                    step_decoder_prefill_latency_ms)
+                setattr(request, "decoder_prefill_latency_ms",
+                        req_decoder_prefill_latency_ms)
 
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id))
@@ -971,6 +994,14 @@ class Scheduler(SchedulerInterface):
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
                         kv_transfer_params=kv_transfer_params,
+                        mm_encoder_latency_ms=mm_encoder_latency_ms.get(
+                            req_id,
+                            getattr(request, "mm_encoder_latency_ms", None)),
+                        decoder_prefill_latency_ms=(
+                            decoder_prefill_latency_ms.get(
+                                req_id, getattr(request,
+                                                "decoder_prefill_latency_ms",
+                                                None))),
                         trace_headers=request.trace_headers,
                         num_cached_tokens=request.num_cached_tokens,
                     ))

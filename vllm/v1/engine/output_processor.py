@@ -123,6 +123,8 @@ class RequestState:
         self.num_cached_tokens = 0
         self.embedding_start_time = embedding_start_time
         self.embedding_end_time = embedding_end_time
+        self.mm_encoder_latency_ms: Optional[float] = None
+        self.decoder_prefill_latency_ms: Optional[float] = None
 
         self.stats = RequestStateStats(
             arrival_time=arrival_time) if log_stats else None
@@ -291,7 +293,9 @@ class RequestState:
             time_in_queue=queued_time,
             finished_time=time.time(),
             embedding_start_time=self.embedding_start_time,
-            embedding_end_time=self.embedding_end_time
+            embedding_end_time=self.embedding_end_time,
+            mm_encoder_latency_ms=self.mm_encoder_latency_ms,
+            decoder_prefill_latency_ms=self.decoder_prefill_latency_ms,
         )
         return metrics
 
@@ -462,6 +466,16 @@ class OutputProcessor:
             stop_reason = engine_core_output.stop_reason
             kv_transfer_params = engine_core_output.kv_transfer_params
             req_state.num_cached_tokens = engine_core_output.num_cached_tokens
+            if engine_core_output.mm_encoder_latency_ms is not None:
+                # Scheduler may report cumulative MM encoder latency across
+                # steps, so keep the latest value.
+                req_state.mm_encoder_latency_ms = (
+                    engine_core_output.mm_encoder_latency_ms)
+            if engine_core_output.decoder_prefill_latency_ms is not None:
+                # Scheduler now reports cumulative prefill latency, so keep
+                # the latest value rather than first-seen only.
+                req_state.decoder_prefill_latency_ms = (
+                    engine_core_output.decoder_prefill_latency_ms)
             req_state.is_prefilling = False
 
             if pooling_output is None:
