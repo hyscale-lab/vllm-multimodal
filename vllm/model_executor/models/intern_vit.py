@@ -51,6 +51,7 @@ def build_prune_mask_from_embeddings(
     """
     Build a boolean prune mask from input embeddings.
     True means "prune/skip", False means "recompute". CLS is always recompute.
+    `prune_ratio` is the fraction of non-CLS tokens to prune/skip.
     """
     if embeddings.ndim == 2:
         embeddings = embeddings.unsqueeze(0)
@@ -77,7 +78,7 @@ def build_prune_mask_from_embeddings(
     similarity = (curr * prev).sum(dim=-1)  # [B, N-1]
     debug = os.environ.get("VLLM_INTERNVL_REUSE_DEBUG", "0") == "1"
 
-    recompute_count = int(round((num_tokens - 1) * prune_ratio))
+    recompute_count = int(round((num_tokens - 1) * (1.0 - prune_ratio)))
     recompute_count = max(0, min(num_tokens - 1, recompute_count))
 
     prune_mask = torch.ones((batch_size, num_tokens),
@@ -89,9 +90,10 @@ def build_prune_mask_from_embeddings(
         sim0 = similarity[0]
         logger.info(
             "InternVL prune similarity: tokens=%s cls_index=%s "
-            "recompute_count=%s sim[min/mean/max]=%.4f/%.4f/%.4f",
+            "prune_ratio=%.3f recompute_count=%s sim[min/mean/max]=%.4f/%.4f/%.4f",
             num_tokens,
             cls_index,
+            prune_ratio,
             recompute_count,
             float(sim0.min().item()),
             float(sim0.mean().item()),
@@ -561,6 +563,12 @@ class InternVisionEncoder(nn.Module):
             if cache is None:
                 raise ValueError(
                     "Prune cache is missing for compact pruning.")
+
+            # If all tokens are dynamic, compact pruning degenerates to the
+            # regular layer forward; avoid clone/index_copy overhead.
+            if dynamic_idx.numel() == cache.shape[1]:
+                hidden_states = encoder_layer(hidden_states)
+                continue
 
             full_hidden = cache.clone()
             full_hidden.index_copy_(1, dynamic_idx, hidden_states)

@@ -12,6 +12,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Annotated, Any, Literal, Optional, TypeVar, Union
 
+import numpy as np
 import numpy.typing as npt
 import torch
 import torch.nn as nn
@@ -68,8 +69,6 @@ def _get_internvl_prune_settings() -> dict[str, object]:
             "VLLM_INTERNVL_PRUNE_RATIO",
             os.environ.get("VLLM_INTERNVL_REUSE_RECOMPUTE_RATIO", "0.2"),
         ))
-    enable_images = (os.environ.get("VLLM_INTERNVL_PRUNE_IMAGES", "0") == "1"
-                     or os.environ.get("VLLM_INTERNVL_REUSE_IMAGES", "0") == "1")
     debug = (os.environ.get("VLLM_INTERNVL_PRUNE_DEBUG", "0") == "1"
              or os.environ.get("VLLM_INTERNVL_REUSE_DEBUG", "0") == "1")
     disable_batching = (
@@ -77,7 +76,6 @@ def _get_internvl_prune_settings() -> dict[str, object]:
     return {
         "enabled": enabled,
         "prune_ratio": prune_ratio,
-        "enable_images": enable_images,
         "debug": debug,
         "disable_batching": disable_batching,
     }
@@ -327,6 +325,9 @@ def video_to_pixel_values_internvl(
     transform = build_transform(input_size=input_size)
     frames_list = list[Image.Image]()
     for frame in video:
+    # Startup profiling may provide int64 dummy frames; Pillow expects uint8.
+        if frame.dtype != np.uint8:
+            frame = np.asarray(frame).clip(0, 255).astype(np.uint8)
         pil_frame = dynamic_preprocess_internvl(
             Image.fromarray(frame, mode="RGB"),
             target_ratios=target_ratios,
@@ -440,13 +441,14 @@ class BaseInternVLProcessor(ABC):
 
         return get_internvl_target_ratios(min_num, max_num)
 
-    def _get_pruned_tokens_per_frame(self) -> Optional[int]:
+    def _get_kept_tokens_per_frame(self) -> Optional[int]:
         settings = _get_internvl_prune_settings()
         if not settings["enabled"]:
             return None
         prune_ratio = float(settings["prune_ratio"])
         prune_ratio = max(0.0, min(1.0, prune_ratio))
-        return max(0, int(round(self.num_image_token * prune_ratio)))
+        # prune_ratio is the fraction removed; keep the remainder.
+        return max(0, int(round(self.num_image_token * (1.0 - prune_ratio))))
 
     def get_num_image_tokens(
         self,
@@ -516,9 +518,27 @@ class BaseInternVLProcessor(ABC):
                 torch.tensor([len(item) for item in pixel_values_lst]),
             }
 
-            for pixel_values in pixel_values_lst:
+            kept_tokens = self._get_kept_tokens_per_frame()
+            use_image_sequence_prune = (
+                kept_tokens is not None
+                and len(pixel_values_lst) > 1
+                and all(item.shape[0] == 1 for item in pixel_values_lst))
+
+            for item_idx, pixel_values in enumerate(pixel_values_lst):
                 num_patches = pixel_values.shape[0]
                 feature_size = num_patches * self.num_image_token
+                if kept_tokens is not None:
+                    if use_image_sequence_prune:
+                        # In frame-as-images mode, keep per-item token counts
+                        # deterministic under chunked scheduling.
+                        feature_size = kept_tokens
+                    else:
+                        # For regular image mode, keep all tokens from the
+                        # first patch and prune remaining patches.
+                        feature_size = (
+                            kept_tokens if num_patches == 1 else
+                            (self.num_image_token
+                             + max(num_patches - 1, 0) * kept_tokens))
 
                 image_repl = self.get_image_repl(feature_size, num_patches)
                 text = [t.replace('<image>', image_repl.full, 1) for t in text]
@@ -706,12 +726,12 @@ class InternVLProcessor(BaseInternVLProcessor):
         if num_patches is None:
             num_patches = 0
 
-        pruned_tokens = self._get_pruned_tokens_per_frame()
-        if pruned_tokens is None:
+        kept_tokens = self._get_kept_tokens_per_frame()
+        if kept_tokens is None:
             frame_token_counts = [self.num_image_token] * num_patches
         else:
             frame_token_counts = [self.num_image_token] + [
-                pruned_tokens for _ in range(max(num_patches - 1, 0))
+                kept_tokens for _ in range(max(num_patches - 1, 0))
             ]
 
         repl_full = ''.join([
@@ -875,6 +895,19 @@ class BaseInternVLMultiModalProcessor(BaseMultiModalProcessor[_I]):
         else:
             image_num_patches = []
 
+        settings = _get_internvl_prune_settings()
+        prune_enabled = bool(settings["enabled"])
+        prune_ratio = float(settings["prune_ratio"])
+        prune_ratio = max(0.0, min(1.0, prune_ratio))
+        kept_tokens_per_patch = max(
+            0, int(round(hf_processor.num_image_token * (1.0 - prune_ratio))))
+        # Frame-as-images mode: many image items where each item has one patch.
+        # These are processed as one temporal sequence in the encoder.
+        image_sequence_mode = (
+            prune_enabled
+            and len(image_num_patches) > 1
+            and all((p == 1) for p in image_num_patches if p is not None))
+
         def get_replacement_internvl(item_idx: int):
             images = mm_items.get_items(
                 "image", (ImageEmbeddingItems, ImageProcessorItems))
@@ -882,12 +915,26 @@ class BaseInternVLMultiModalProcessor(BaseMultiModalProcessor[_I]):
             if isinstance(images, ImageEmbeddingItems):
                 feature_size = images.get_feature_size(item_idx)
             else:
-                image_size = images.get_image_size(item_idx)
-                feature_size = self.info.get_num_image_tokens(
-                    image_width=image_size.width,
-                    image_height=image_size.height,
-                    processor=hf_processor,
-                )
+                num_patches = image_num_patches[item_idx]
+                if num_patches is not None and prune_enabled:
+                    # Keep prompt placeholders aligned with
+                    # InternVLProcessor._preprocess_image.
+                    if image_sequence_mode:
+                        feature_size = kept_tokens_per_patch
+                    else:
+                        feature_size = (
+                            kept_tokens_per_patch if num_patches == 1 else
+                            (hf_processor.num_image_token
+                             + max(num_patches - 1, 0) * kept_tokens_per_patch))
+                elif num_patches is not None:
+                    feature_size = num_patches * hf_processor.num_image_token
+                else:
+                    image_size = images.get_image_size(item_idx)
+                    feature_size = self.info.get_num_image_tokens(
+                        image_width=image_size.width,
+                        image_height=image_size.height,
+                        processor=hf_processor,
+                    )
 
             num_patches = image_num_patches[item_idx]
             if num_patches is not None:
@@ -1224,13 +1271,14 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
         if current.shape != reference.shape:
             raise ValueError("Prune reference shape mismatch.")
 
+        # prune_ratio is the fraction removed.
         if prune_ratio >= 1.0:
-            return current
-        if prune_ratio <= 0.0:
             return current[:, :0, :]
+        if prune_ratio <= 0.0:
+            return current
 
         batch_size, num_tokens, hidden_size = current.shape
-        retain = int(round(num_tokens * prune_ratio))
+        retain = int(round(num_tokens * (1.0 - prune_ratio)))
         retain = max(0, min(num_tokens, retain))
         if retain == num_tokens:
             return current
@@ -1241,6 +1289,8 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
         reference_norm = F.normalize(reference, dim=-1)
         similarity = (current_norm * reference_norm).sum(dim=-1)
         _, indices = torch.topk(similarity, k=retain, dim=-1, largest=False)
+        # Preserve original token order (topk returns score order).
+        indices, _ = torch.sort(indices, dim=-1)
         gather_idx = indices.unsqueeze(-1).expand(batch_size, retain,
                                                   hidden_size)
         return torch.gather(current, dim=1, index=gather_idx)
@@ -1262,7 +1312,15 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
 
         outputs: list[torch.Tensor] = []
         offset = 0
-        for count in num_patches.tolist():
+        counts = num_patches.tolist()
+        frame_as_images_mode = (settings["enabled"] and len(counts) > 1
+                                and all(c == 1 for c in counts))
+        if frame_as_images_mode:
+            # Frame-as-images input: process all image items as one temporal
+            # sequence so reuse/pruning can be applied across frames.
+            counts = [len(counts)]
+
+        for count in counts:
             if count <= 0:
                 continue
             seq_embeddings = all_embeddings[offset:offset + count]
@@ -1357,7 +1415,16 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
                 vision_out = self.mlp1(vision_out)
                 if frame_idx == 0:
                     key_out = vision_out
-                    outputs.append(vision_out.squeeze(0))
+                    first_out = vision_out
+                    if frame_as_images_mode or count == 1:
+                        # Keep placeholder counts aligned for every image item
+                        # in frame-as-images mode and single-patch execution.
+                        first_out = self._select_pruned_tokens(
+                            vision_out,
+                            vision_out,
+                            prune_ratio=settings["prune_ratio"],
+                        )
+                    outputs.append(first_out.squeeze(0))
                 else:
                     assert key_out is not None
                     pruned_out = self._select_pruned_tokens(
@@ -1506,9 +1573,8 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
         assert self.vision_model is not None
 
         settings = self._get_prune_settings()
-        prune_enabled = settings["enabled"] and (
-            image_input["type"] == "pixel_values_videos"
-            or settings["enable_images"])
+        prune_enabled = settings["enabled"] and image_input[
+            "type"] in ("pixel_values_videos", "pixel_values")
         if prune_enabled:
             image_embeds = self._extract_feature_with_prune(
                 image_input["pixel_values_flat"], image_input["num_patches"])
