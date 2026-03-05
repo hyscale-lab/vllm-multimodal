@@ -37,9 +37,12 @@ from vllm.multimodal.inputs import (MultiModalDataDict, MultiModalFieldConfig,
                                     MultiModalKwargsItems, NestedTensors)
 from vllm.multimodal.parse import (ImageEmbeddingItems, ImageProcessorItems,
                                    ImageSize, MultiModalDataItems)
+from vllm.multimodal.hasher import MultiModalHasher
 from vllm.multimodal.processing import (BaseMultiModalProcessor,
-                                        BaseProcessingInfo, PromptReplacement,
-                                        PromptUpdate, PromptUpdateDetails)
+                                        BaseProcessingInfo,
+                                        MultiModalProcessingInfo,
+                                        PromptReplacement, PromptUpdate,
+                                        PromptUpdateDetails)
 from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.tokenizer import AnyTokenizer
@@ -93,6 +96,9 @@ class InternVLImagePixelInputs(TensorSchema):
     type: Literal["pixel_values"]
     pixel_values_flat: Annotated[torch.Tensor, TensorShape("bnp", 3, "h", "w")]
     num_patches: Annotated[torch.Tensor, TensorShape("bn")]
+    codec_anchor_idx: Optional[torch.Tensor]  # [num_frames]
+    codec_prune_mask: Optional[torch.Tensor]  # [num_frames, 1025]
+    codec_proj_mask: Optional[torch.Tensor]  # [num_frames, 256]
 
 
 class InternVLImageEmbeddingInputs(TensorSchema):
@@ -123,6 +129,9 @@ class InternVLVideoPixelInputs(TensorSchema):
     type: Literal["pixel_values_videos"]
     pixel_values_flat: Annotated[torch.Tensor, TensorShape("bvf", 3, "h", "w")]
     num_patches: Annotated[torch.Tensor, TensorShape("bn")]
+    codec_anchor_idx: Optional[torch.Tensor]  # [num_frames]
+    codec_prune_mask: Optional[torch.Tensor]  # [num_frames, 1025]
+    codec_proj_mask: Optional[torch.Tensor]  # [num_frames, 256]
 
 
 class InternVLVideoEmbeddingInputs(TensorSchema):
@@ -501,6 +510,7 @@ class BaseInternVLProcessor(ABC):
         min_dynamic_patch: Optional[int] = None,
         max_dynamic_patch: Optional[int] = None,
         dynamic_image_size: Optional[bool] = None,
+        codec_frame_info: Optional[list[dict]] = None,
     ) -> tuple[list[str], dict[str, torch.Tensor]]:
         if len(images) == 0:
             image_inputs = {}
@@ -527,14 +537,15 @@ class BaseInternVLProcessor(ABC):
             for item_idx, pixel_values in enumerate(pixel_values_lst):
                 num_patches = pixel_values.shape[0]
                 feature_size = num_patches * self.num_image_token
-                if kept_tokens is not None:
+
+                if codec_frame_info is not None and \
+                        item_idx < len(codec_frame_info):
+                    feature_size = int(
+                        codec_frame_info[item_idx]["kept_count"])
+                elif kept_tokens is not None:
                     if use_image_sequence_prune:
-                        # In frame-as-images mode, keep per-item token counts
-                        # deterministic under chunked scheduling.
                         feature_size = kept_tokens
                     else:
-                        # For regular image mode, keep all tokens from the
-                        # first patch and prune remaining patches.
                         feature_size = (
                             kept_tokens if num_patches == 1 else
                             (self.num_image_token
@@ -560,6 +571,8 @@ class BaseInternVLProcessor(ABC):
         max_dynamic_patch: Optional[int] = None,
         dynamic_image_size: Optional[bool] = None,
         return_tensors: Optional[Union[str, TensorType]] = None,
+        codec_frame_info: Optional[list[dict]] = None,
+        **kwargs,
     ) -> Mapping[str, NestedTensors]:
         text, images = [self._make_batch_input(x) for x in (text, images)]
 
@@ -569,6 +582,7 @@ class BaseInternVLProcessor(ABC):
             min_dynamic_patch=min_dynamic_patch,
             max_dynamic_patch=max_dynamic_patch,
             dynamic_image_size=dynamic_image_size,
+            codec_frame_info=codec_frame_info,
         )
 
         text_inputs = self.tokenizer(text)
@@ -680,6 +694,8 @@ class InternVLProcessor(BaseInternVLProcessor):
         max_dynamic_patch: Optional[int] = None,
         dynamic_image_size: Optional[bool] = None,
         return_tensors: Optional[Union[str, TensorType]] = None,
+        codec_frame_info: Optional[list[dict]] = None,
+        **kwargs,
     ) -> Mapping[str, NestedTensors]:
         text, images, videos = [
             self._make_batch_input(x) for x in (text, images, videos)
@@ -691,6 +707,7 @@ class InternVLProcessor(BaseInternVLProcessor):
             min_dynamic_patch=min_dynamic_patch,
             max_dynamic_patch=max_dynamic_patch,
             dynamic_image_size=dynamic_image_size,
+            codec_frame_info=codec_frame_info,
         )
 
         text, video_inputs = self._preprocess_video(
@@ -722,17 +739,21 @@ class InternVLProcessor(BaseInternVLProcessor):
         feature_size: int,
         num_patches: Optional[int] = None,
         video_context_token: str = IMG_CONTEXT,
+        per_frame_counts: Optional[list[int]] = None,
     ) -> PromptUpdateDetails[str]:
         if num_patches is None:
             num_patches = 0
 
-        kept_tokens = self._get_kept_tokens_per_frame()
-        if kept_tokens is None:
-            frame_token_counts = [self.num_image_token] * num_patches
+        if per_frame_counts is not None:
+            frame_token_counts = per_frame_counts
         else:
-            frame_token_counts = [self.num_image_token] + [
-                kept_tokens for _ in range(max(num_patches - 1, 0))
-            ]
+            kept_tokens = self._get_kept_tokens_per_frame()
+            if kept_tokens is None:
+                frame_token_counts = [self.num_image_token] * num_patches
+            else:
+                frame_token_counts = [self.num_image_token] + [
+                    kept_tokens for _ in range(max(num_patches - 1, 0))
+                ]
 
         repl_full = ''.join([
             f'Frame{i+1}: {IMG_START}'
@@ -908,17 +929,24 @@ class BaseInternVLMultiModalProcessor(BaseMultiModalProcessor[_I]):
             and len(image_num_patches) > 1
             and all((p == 1) for p in image_num_patches if p is not None))
 
+        img_codec_kept_t = out_mm_data.get("codec_kept_counts")
+        img_codec_kept: Optional[list[int]] = None
+        if isinstance(img_codec_kept_t, torch.Tensor) and \
+                img_codec_kept_t.numel() > 0:
+            img_codec_kept = img_codec_kept_t.tolist()
+
         def get_replacement_internvl(item_idx: int):
             images = mm_items.get_items(
                 "image", (ImageEmbeddingItems, ImageProcessorItems))
 
             if isinstance(images, ImageEmbeddingItems):
                 feature_size = images.get_feature_size(item_idx)
+            elif img_codec_kept is not None and \
+                    item_idx < len(img_codec_kept):
+                feature_size = int(img_codec_kept[item_idx])
             else:
                 num_patches = image_num_patches[item_idx]
                 if num_patches is not None and prune_enabled:
-                    # Keep prompt placeholders aligned with
-                    # InternVLProcessor._preprocess_image.
                     if image_sequence_mode:
                         feature_size = kept_tokens_per_patch
                     else:
@@ -1037,6 +1065,124 @@ class InternVLMultiModalProcessor(
         BaseInternVLMultiModalProcessor[InternVLProcessingInfo]):
     """InternVL MultiModalProcessor extended for video support"""
 
+    def _hash_mm_items(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        tokenization_kwargs: Mapping[str, object],
+        **kwargs,
+    ):
+        codec_info = hf_processor_mm_kwargs.get("codec_frame_info")
+        clean_kwargs = {k: v for k, v in hf_processor_mm_kwargs.items()
+                        if k != "codec_frame_info"}
+        if codec_info is None:
+            return super()._hash_mm_items(
+                mm_items, clean_kwargs, tokenization_kwargs, **kwargs)
+
+        kept_counts = [f["kept_count"] for f in codec_info]
+        model_id = self.info.model_id
+        hashes: dict[str, list[str]] = {}
+        for modality, items in mm_items.items():
+            modality_hashes: list[str] = []
+            for i, item in enumerate(items):
+                per_item_kw = dict(clean_kwargs)
+                if i < len(kept_counts):
+                    per_item_kw["_codec_kept"] = kept_counts[i]
+                modality_hashes.append(
+                    MultiModalHasher.hash_kwargs(
+                        model_id=model_id,
+                        **{modality: item},
+                        **per_item_kw,
+                        **tokenization_kwargs))
+            hashes[modality] = modality_hashes
+        return hashes
+
+    def _cached_apply_hf_processor(self, prompt, mm_data_items,
+                                   hf_processor_mm_kwargs,
+                                   tokenization_kwargs, **kwargs):
+        codec_frame_info = hf_processor_mm_kwargs.get("codec_frame_info")
+        if codec_frame_info is None:
+            return super()._cached_apply_hf_processor(
+                prompt, mm_data_items, hf_processor_mm_kwargs,
+                tokenization_kwargs, **kwargs)
+
+        cache = self.cache
+        _, passthrough_data = self._get_hf_mm_data(mm_data_items)
+        if cache is None or passthrough_data:
+            return self._apply_hf_processor(
+                prompt=prompt,
+                mm_data_items=mm_data_items,
+                hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+                tokenization_kwargs=tokenization_kwargs,
+                **kwargs)
+
+        mm_hashes = self._hash_mm_items(
+            mm_data_items, hf_processor_mm_kwargs,
+            tokenization_kwargs, **kwargs)
+
+        mm_is_cached = {
+            modality: cache.is_cached(hashes)
+            for modality, hashes in mm_hashes.items()
+        }
+        mm_missing_idxs: dict[str, list[int]] = {
+            modality: [
+                idx for idx, is_cached
+                in enumerate(items_is_cached) if not is_cached
+            ]
+            for modality, items_is_cached in mm_is_cached.items()
+        }
+        mm_missing_data: dict[str, list] = {}
+        for modality, idxs in mm_missing_idxs.items():
+            mm_missing_data[modality] = [
+                mm_data_items[modality][idx] for idx in idxs]
+        mm_missing_data_items = self._to_mm_items(mm_missing_data)
+
+        image_missing_idxs = mm_missing_idxs.get("image", [])
+        filtered_codec = ([codec_frame_info[i] for i in image_missing_idxs]
+                          if image_missing_idxs else None)
+        filtered_kwargs = dict(hf_processor_mm_kwargs)
+        if filtered_codec:
+            filtered_kwargs["codec_frame_info"] = filtered_codec
+        else:
+            filtered_kwargs.pop("codec_frame_info", None)
+
+        (
+            prompt_ids,
+            mm_missing_processed_data,
+            is_update_applied,
+        ) = self._apply_hf_processor_main(
+            prompt=prompt,
+            mm_items=mm_missing_data_items,
+            hf_processor_mm_kwargs=filtered_kwargs,
+            tokenization_kwargs=tokenization_kwargs,
+            enable_hf_prompt_update=False,
+        )
+
+        mm_missing_kwargs = MultiModalKwargsItems.from_hf_inputs(
+            mm_missing_processed_data,
+            self._get_mm_fields_config(mm_missing_processed_data,
+                                       hf_processor_mm_kwargs),
+        )
+        mm_missing_prompt_updates = self._get_mm_prompt_updates(
+            mm_missing_data_items,
+            hf_processor_mm_kwargs,
+            mm_missing_kwargs,
+        )
+
+        mm_kwargs, mm_prompt_updates = self._merge_mm_kwargs(
+            cache,
+            mm_hashes=mm_hashes,
+            mm_missing_kwargs=mm_missing_kwargs,
+            mm_missing_prompt_updates=mm_missing_prompt_updates,
+        )
+
+        mm_info = MultiModalProcessingInfo(
+            kwargs=mm_kwargs,
+            hashes=mm_hashes,
+            prompt_updates=mm_prompt_updates,
+        )
+        return prompt_ids, mm_info, is_update_applied
+
     def _call_hf_processor(
         self,
         prompt: str,
@@ -1044,13 +1190,52 @@ class InternVLMultiModalProcessor(
         mm_kwargs: Mapping[str, object],
         tok_kwargs: Mapping[str, object],
     ) -> Mapping[str, NestedTensors]:
-        processed_outputs = super()._call_hf_processor(prompt, mm_data,
-                                                       mm_kwargs, tok_kwargs)
+        mm_kwargs_clean = {k: v for k, v in mm_kwargs.items()
+                          if k != "codec_frame_info"}
+        codec_frame_info = mm_kwargs.get("codec_frame_info")
 
-        hf_processor = self.info.get_hf_processor(**mm_kwargs)
+        hf_processor = self.info.get_hf_processor(**mm_kwargs_clean)
+        processed_outputs = self.info.ctx.call_hf_processor(
+            hf_processor,
+            dict(text=prompt, **mm_data),
+            dict(**mm_kwargs, **tok_kwargs),
+        )
+
+        processed_outputs["image_token_id"] = torch.tensor(
+            hf_processor.image_token_id)
         if self.info.supports_video and (
-                video_token_id := hf_processor.video_token_id) is not None:
-            processed_outputs["video_token_id"] = torch.tensor(video_token_id)
+                video_token_id := hf_processor.video_token_id
+        ) is not None:
+            processed_outputs["video_token_id"] = torch.tensor(
+                video_token_id)
+
+        if codec_frame_info is not None:
+            num_frames = len(codec_frame_info)
+            anchor_idx = torch.tensor(
+                [f["anchor_idx"] for f in codec_frame_info],
+                dtype=torch.long)
+            num_tokens = 1025  # CLS + 32*32 patches
+            num_proj = 256  # 16*16 after pixel_shuffle
+            prune_mask = torch.zeros(
+                num_frames, num_tokens, dtype=torch.bool)
+            proj_mask = torch.zeros(
+                num_frames, num_proj, dtype=torch.bool)
+            kept_counts = torch.full(
+                (num_frames,), num_proj, dtype=torch.long)
+            for i, f in enumerate(codec_frame_info):
+                if f.get("mask") is not None:
+                    prune_mask[i] = torch.tensor(
+                        f["mask"], dtype=torch.bool)
+                if f.get("proj_mask") is not None:
+                    proj_mask[i] = torch.tensor(
+                        f["proj_mask"], dtype=torch.bool)
+                if f.get("kept_count") is not None:
+                    kept_counts[i] = f["kept_count"]
+            processed_outputs["codec_anchor_idx"] = anchor_idx
+            processed_outputs["codec_prune_mask"] = prune_mask
+            processed_outputs["codec_proj_mask"] = proj_mask
+            processed_outputs["codec_kept_counts"] = kept_counts
+
         return processed_outputs
 
     def _get_mm_fields_config(
@@ -1058,23 +1243,47 @@ class InternVLMultiModalProcessor(
         hf_inputs: Mapping[str, NestedTensors],
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
-        image_fields = super()._get_mm_fields_config(hf_inputs,
-                                                     hf_processor_mm_kwargs)
+        image_fields = super()._get_mm_fields_config(
+            hf_inputs, hf_processor_mm_kwargs)
+
+        has_codec = "codec_anchor_idx" in hf_inputs
+        codec_fields: dict[str, MultiModalFieldConfig] = {}
+
         if self.info.supports_video:
             video_num_patches = hf_inputs.get("video_num_patches",
                                               torch.empty(0))
             num_videos = len(video_num_patches)
             video_fields = dict(
-                pixel_values_flat_video=MultiModalFieldConfig.flat_from_sizes(
-                    "video", video_num_patches),
+                pixel_values_flat_video=(
+                    MultiModalFieldConfig.flat_from_sizes(
+                        "video", video_num_patches)),
                 video_num_patches=MultiModalFieldConfig.batched("video"),
                 video_token_id=MultiModalFieldConfig.shared(
                     "video", num_videos),
             )
+            if has_codec and num_videos > 0:
+                codec_modality = "video"
+            elif has_codec:
+                codec_modality = "image"
+            else:
+                codec_modality = None
         else:
             video_fields = {}
+            codec_modality = "image" if has_codec else None
 
-        return image_fields | video_fields
+        if codec_modality is not None:
+            codec_fields = {
+                "codec_anchor_idx":
+                    MultiModalFieldConfig.batched(codec_modality),
+                "codec_prune_mask":
+                    MultiModalFieldConfig.batched(codec_modality),
+                "codec_proj_mask":
+                    MultiModalFieldConfig.batched(codec_modality),
+                "codec_kept_counts":
+                    MultiModalFieldConfig.batched(codec_modality),
+            }
+
+        return image_fields | video_fields | codec_fields
 
     def _get_prompt_updates(
         self,
@@ -1082,13 +1291,15 @@ class InternVLMultiModalProcessor(
         hf_processor_mm_kwargs: Mapping[str, object],
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
+        clean_kwargs = {k: v for k, v in hf_processor_mm_kwargs.items()
+                        if k != "codec_frame_info"}
         prompt_repl = super()._get_prompt_updates(
             mm_items=mm_items,
-            hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+            hf_processor_mm_kwargs=clean_kwargs,
             out_mm_kwargs=out_mm_kwargs,
         )
 
-        hf_processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
+        hf_processor = self.info.get_hf_processor(**clean_kwargs)
 
         out_mm_data = out_mm_kwargs.get_data()
         if "video_num_patches" in out_mm_data:
@@ -1098,16 +1309,27 @@ class InternVLMultiModalProcessor(
         else:
             video_num_patches = []
 
+        codec_kept_counts_t = out_mm_data.get("codec_kept_counts")
+        codec_kept_counts: Optional[list[int]] = None
+        if isinstance(codec_kept_counts_t, torch.Tensor) and \
+                codec_kept_counts_t.numel() > 0:
+            codec_kept_counts = codec_kept_counts_t.tolist()
+
         def get_video_replacement_internvl(item_idx: int):
             feature_size = hf_processor.num_image_token
             num_patches = video_num_patches[item_idx]
             if num_patches is not None:
                 assert isinstance(num_patches, int)
 
+            per_frame = None
+            if codec_kept_counts is not None:
+                per_frame = [int(c) for c in codec_kept_counts]
+
             return hf_processor.get_video_repl(
                 feature_size,
                 num_patches,
-                video_context_token=hf_processor.video_token)
+                video_context_token=hf_processor.video_token,
+                per_frame_counts=per_frame)
 
         if self.info.supports_video:
             prompt_repl = [
@@ -1250,17 +1472,6 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
     def _get_prune_settings(self) -> dict[str, object]:
         return _get_internvl_prune_settings()
 
-    def _compute_prune_mask_with_codec(
-        self,
-        *,
-        num_tokens: int,
-        device: torch.device,
-    ) -> Optional[torch.Tensor]:
-        """Placeholder for codec-derived prune masks (SAD/MV/skip)."""
-        _ = num_tokens
-        _ = device
-        return None
-
     def _select_pruned_tokens(
         self,
         current: torch.Tensor,
@@ -1282,7 +1493,7 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
         retain = max(0, min(num_tokens, retain))
         if retain == num_tokens:
             return current
-        if retain == 0:
+        if retain == 0:                 
             return current[:, :0, :]
 
         current_norm = F.normalize(current, dim=-1)
@@ -1296,19 +1507,92 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
         return torch.gather(current, dim=1, index=gather_idx)
 
 
+    def _encode_anchor_group_packed(
+        self,
+        seq_embeddings: torch.Tensor,
+        anchor_enc_out: torch.Tensor,
+        anchor_projected: torch.Tensor,
+        frame_indices: list[int],
+        dynamic_indices: list[torch.Tensor],
+        prune_ratio: float,
+        proj_masks: Optional[dict[int, torch.Tensor]] = None,
+    ) -> dict[int, torch.Tensor]:
+        """Encode a group of non-anchor frames using packed sequences.
+
+        Args:
+            proj_masks: if provided, maps frame_idx -> bool mask of shape
+                [num_proj_tokens] where True = dynamic (keep for LLM).
+                When present, replaces similarity-based _select_pruned_tokens.
+
+        Returns a dict mapping frame_idx -> projected output tensor (squeezed).
+        """
+        all_dyn: list[torch.Tensor] = []
+        seqlens: list[int] = []
+        for fi, dyn_idx in zip(frame_indices, dynamic_indices):
+            all_dyn.append(seq_embeddings[fi].index_select(0, dyn_idx))
+            seqlens.append(dyn_idx.numel())
+
+        packed = torch.cat(all_dyn, dim=0).unsqueeze(0)
+        cu_seqlens = torch.zeros(
+            len(seqlens) + 1, dtype=torch.int32, device=packed.device)
+        torch.cumsum(
+            torch.tensor(seqlens, dtype=torch.int32, device=packed.device),
+            dim=0, out=cu_seqlens[1:])
+
+        packed_out = self.vision_model(
+            pixel_embeds=packed,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max(seqlens))
+
+        num_frames = len(frame_indices)
+        full_batch = anchor_enc_out.expand(num_frames, -1, -1).clone()
+        pack_offset = 0
+        for i, dyn_idx in enumerate(dynamic_indices):
+            D_i = dyn_idx.numel()
+            full_batch[i].index_copy_(
+                0, dyn_idx,
+                packed_out[0, pack_offset:pack_offset + D_i])
+            pack_offset += D_i
+
+        projected_batch = self._project_vit_embeddings(full_batch)
+
+        results: dict[int, torch.Tensor] = {}
+        for i, fi in enumerate(frame_indices):
+            if proj_masks is not None and fi in proj_masks:
+                keep_idx = proj_masks[fi].nonzero(
+                    as_tuple=False).squeeze(-1)
+                if keep_idx.numel() == 0:
+                    keep_idx = torch.zeros(
+                        1, dtype=torch.long, device=keep_idx.device)
+                results[fi] = projected_batch[i].index_select(0, keep_idx)
+            else:
+                pruned = self._select_pruned_tokens(
+                    projected_batch[i:i + 1], anchor_projected,
+                    prune_ratio=prune_ratio)
+                results[fi] = pruned.squeeze(0)
+        return results
+
     def _extract_feature_with_prune(
         self,
         pixel_values: torch.Tensor,
         num_patches: torch.Tensor,
+        *,
+        codec_anchor_idx: Optional[torch.Tensor] = None,
+        codec_prune_mask: Optional[torch.Tensor] = None,
+        codec_proj_mask: Optional[torch.Tensor] = None,
     ) -> list[torch.Tensor]:
         settings = self._get_prune_settings()
         if not settings["enabled"]:
             return self.extract_feature(pixel_values)
 
-        embeddings_fn = self.vision_model.get_input_embeddings()
-        all_embeddings = embeddings_fn(pixel_values)
-        num_layers = len(self.vision_model.encoder.layers)
         debug = bool(settings.get("debug", False))
+        has_codec = (codec_anchor_idx is not None
+                     and codec_prune_mask is not None)
+
+        all_embeddings = None
+        if not has_codec:
+            embeddings_fn = self.vision_model.get_input_embeddings()
+            all_embeddings = embeddings_fn(pixel_values)
 
         outputs: list[torch.Tensor] = []
         offset = 0
@@ -1316,127 +1600,306 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
         frame_as_images_mode = (settings["enabled"] and len(counts) > 1
                                 and all(c == 1 for c in counts))
         if frame_as_images_mode:
-            # Frame-as-images input: process all image items as one temporal
-            # sequence so reuse/pruning can be applied across frames.
             counts = [len(counts)]
 
         for count in counts:
             if count <= 0:
                 continue
-            seq_embeddings = all_embeddings[offset:offset + count]
-            key_cache: list[Optional[torch.Tensor]] = [None] * num_layers
-            key_emb: Optional[torch.Tensor] = None
-            key_out: Optional[torch.Tensor] = None
-            key_encoder_out: Optional[torch.Tensor] = None
-            for frame_idx in range(count):
-                emb = seq_embeddings[frame_idx:frame_idx + 1]
-                if frame_idx == 0:
-                    key_emb = emb
-                    prune_mask = torch.zeros(
-                        (1, emb.size(1)),
-                        dtype=torch.bool,
-                        device=emb.device,
-                    )
-                    prune_update_cache = True
-                    if debug:
-                        logger.info(
-                            "InternVL prune: frame=%s/%s key frame, "
-                            "all recompute (tokens=%s).",
-                            frame_idx,
-                            count - 1,
-                            emb.size(1),
-                        )
-                else:
-                    assert key_emb is not None
-                    if debug:
-                        logger.info(
-                            "InternVL prune: frame=%s/%s ref_frame=%s "
-                            "(key frame).",
-                            frame_idx,
-                            count - 1,
-                            0,
-                        )
-                    prune_mask = build_prune_mask_from_embeddings(
-                        emb,
-                        key_emb,
-                        prune_ratio=settings["prune_ratio"],
-                        cls_index=0,
-                    )
-                    codec_mask = self._compute_prune_mask_with_codec(
-                        num_tokens=emb.size(1),
-                        device=emb.device,
-                    )
-                    if codec_mask is not None:
-                        prune_mask = codec_mask
-                    prune_update_cache = False
-                    if debug:
-                        num_tokens = prune_mask.numel()
-                        num_skip = int(prune_mask.sum().item())
-                        num_recompute = num_tokens - num_skip
-                        skip_ratio = num_skip / max(1, num_tokens)
-                        logger.info(
-                            "InternVL prune: frames=%s "
-                            "prune_ratio=%.3f skip_ratio=%.3f "
-                            "(skip=%s, recompute=%s, tokens=%s)",
-                            count,
-                            settings["prune_ratio"],
-                            skip_ratio,
-                            num_skip,
-                            num_recompute,
-                            num_tokens,
-                        )
 
-                vision_out = self.vision_model(
-                    pixel_embeds=emb,
-                    prune_mask=prune_mask,
-                    prune_cache=key_cache,
-                    prune_update_cache=prune_update_cache,
-                )
-                if frame_idx == 0:
-                    key_encoder_out = vision_out
-                else:
-                    assert key_encoder_out is not None
-                    dynamic_idx = (~prune_mask[0]).nonzero(
-                        as_tuple=False).squeeze(-1)
-                    full_encoder_out = key_encoder_out.clone()
-                    if dynamic_idx.numel() > 0:
-                        full_encoder_out.index_copy_(1, dynamic_idx,
-                                                     vision_out)
-                    vision_out = full_encoder_out
-                vision_out = vision_out[:, 1:, :]
-                h = w = int(vision_out.shape[1]**0.5)
-                vision_out = vision_out.reshape(vision_out.shape[0], h, w, -1)
-                vision_out = self.pixel_shuffle(
-                    vision_out,
-                    scale_factor=self.downsample_ratio,
-                )
-                vision_out = vision_out.reshape(vision_out.shape[0], -1,
-                                                vision_out.shape[-1])
-                vision_out = self.mlp1(vision_out)
-                if frame_idx == 0:
-                    key_out = vision_out
-                    first_out = vision_out
-                    if frame_as_images_mode or count == 1:
-                        # Keep placeholder counts aligned for every image item
-                        # in frame-as-images mode and single-patch execution.
-                        first_out = self._select_pruned_tokens(
-                            vision_out,
-                            vision_out,
-                            prune_ratio=settings["prune_ratio"],
-                        )
-                    outputs.append(first_out.squeeze(0))
-                else:
-                    assert key_out is not None
-                    pruned_out = self._select_pruned_tokens(
-                        vision_out,
-                        key_out,
-                        prune_ratio=settings["prune_ratio"],
-                    )
-                    outputs.append(pruned_out.squeeze(0))
+            if has_codec:
+                seq_outputs = self._prune_with_codec(
+                    pixel_values[offset:offset + count], count,
+                    codec_anchor_idx[offset:offset + count],
+                    codec_prune_mask[offset:offset + count],
+                    codec_proj_mask=(
+                        codec_proj_mask[offset:offset + count]
+                        if codec_proj_mask is not None else None),
+                    debug=debug)
+            else:
+                seq_embeddings = all_embeddings[offset:offset + count]
+                seq_outputs = self._full_encode(
+                    seq_embeddings, count, debug=debug)
 
+            outputs.extend(seq_outputs)
             offset += count
 
         return outputs
+
+    def _full_encode(
+        self,
+        seq_embeddings: torch.Tensor,
+        count: int,
+        *,
+        debug: bool,
+    ) -> list[torch.Tensor]:
+        """Full ViT encode for all frames, no pruning.
+
+        Used as fallback when no codec info is available (e.g. profiling).
+        """
+        enc_out = self.vision_model(pixel_embeds=seq_embeddings)
+        all_projected = self._project_vit_embeddings(enc_out)
+        if debug:
+            logger.info(
+                "InternVL full encode: %s frames, %s tokens each.",
+                count, all_projected.size(1))
+        return [all_projected[fi] for fi in range(count)]
+
+    @staticmethod
+    def _expand_prune_mask_to_groups(
+        prune_mask_patches: torch.Tensor,
+    ) -> torch.Tensor:
+        """Expand dynamic patches to full 2x2 pixel_shuffle groups.
+
+        Args:
+            prune_mask_patches: [1024] bool, True = static.
+
+        Returns:
+            encode_mask: [1025] bool, True = include in sparse ViT.
+            CLS (index 0) is always True.  For each 2x2 group that
+            contains at least one dynamic (non-static) patch, all 4
+            patches are marked True so pixel_shuffle gets complete data.
+        """
+        dynamic = ~prune_mask_patches  # True = dynamic
+        dynamic_2d = dynamic.reshape(32, 32)
+        groups = dynamic_2d.reshape(16, 2, 16, 2)
+        group_has_dynamic = groups.any(dim=(1, 3))  # [16, 16]
+        expanded = group_has_dynamic[:, None, :, None].expand(16, 2, 16, 2)
+        encode_patches = expanded.reshape(1024)
+        cls_flag = torch.ones(1, dtype=torch.bool,
+                              device=prune_mask_patches.device)
+        return torch.cat([cls_flag, encode_patches])
+
+    def _sparse_embed_p_frame(
+        self,
+        pixel_values_single: torch.Tensor,
+        encode_mask: torch.Tensor,
+        embeddings_mod: nn.Module,
+    ) -> torch.Tensor:
+        """Embed only the selected patches of a P-frame.
+
+        Instead of running Conv2d on the full image (all 1024 patches),
+        extracts only the pixel regions for patches marked True in
+        encode_mask and applies the Conv2d weight as a linear transform.
+
+        Args:
+            pixel_values_single: [C, H, W] raw pixels for one frame.
+            encode_mask: [1025] bool, True = include (CLS at 0 always True).
+            embeddings_mod: InternVisionEmbeddings module.
+
+        Returns:
+            [k, hidden] embeddings for the k selected positions.
+        """
+        patch_size = embeddings_mod.patch_size
+        target_dtype = embeddings_mod.patch_embedding.weight.dtype
+        C, H, W = pixel_values_single.shape
+        grid_h, grid_w = H // patch_size, W // patch_size
+
+        pv = pixel_values_single.to(target_dtype)
+        pv = pv.reshape(C, grid_h, patch_size, grid_w, patch_size)
+        pv = pv.permute(1, 3, 0, 2, 4).contiguous()
+        all_patches = pv.reshape(grid_h * grid_w, -1)
+
+        patch_mask = encode_mask[1:]
+        selected_patches = all_patches[patch_mask]
+
+        conv_w = embeddings_mod.patch_embedding.weight.reshape(
+            embeddings_mod.embed_dim, -1)
+        conv_b = embeddings_mod.patch_embedding.bias
+        patch_embeds = F.linear(selected_patches, conv_w, conv_b)
+
+        cls_embed = embeddings_mod.class_embedding[0].to(target_dtype)
+        frame_embed = torch.cat([cls_embed, patch_embeds], dim=0)
+
+        pos_full = embeddings_mod._get_position_embedding(grid_h, grid_w)
+        pos_indices = encode_mask.nonzero(as_tuple=False).squeeze(-1)
+        pos_embed = pos_full[0, pos_indices].to(target_dtype)
+        frame_embed = frame_embed + pos_embed
+
+        return frame_embed
+
+    def _prune_with_codec(
+        self,
+        pixel_values: torch.Tensor,
+        count: int,
+        anchor_idx: torch.Tensor,
+        prune_mask: torch.Tensor,
+        *,
+        codec_proj_mask: Optional[torch.Tensor] = None,
+        debug: bool,
+    ) -> list[torch.Tensor]:
+        """Sparse embedding + sparse ViT encoding driven by codec MVs.
+
+        I-frames: full embedding (Conv2d on whole image) + full 1025-token
+        ViT encode.
+        P-frames: sparse embedding (Conv2d weight applied only to dynamic
+        pixel patches) + sparse ViT encode via packed cu_seqlens path.
+
+        All frames are packed into a single flat tensor and encoded in one
+        call, then unpacked, projected, and token-selected.
+
+        No cross-frame dependency -- each frame is self-contained and
+        immune to scheduler batch splits.
+        """
+        if prune_mask.dim() > 2:
+            prune_mask = prune_mask.reshape(count, -1)
+        if codec_proj_mask is not None and codec_proj_mask.dim() > 2:
+            codec_proj_mask = codec_proj_mask.reshape(count, -1)
+
+        device = pixel_values.device
+        embeddings_mod = self.vision_model.get_input_embeddings()
+        num_patches_plus_cls = embeddings_mod.num_positions  # 1025
+
+        is_i_frame = [not prune_mask[fi].any().item() for fi in range(count)]
+
+        # Compute encode masks for P-frames
+        encode_masks: list[Optional[torch.Tensor]] = []
+        for fi in range(count):
+            if is_i_frame[fi]:
+                encode_masks.append(None)
+            else:
+                encode_masks.append(
+                    self._expand_prune_mask_to_groups(prune_mask[fi, 1:]))
+
+        # Batch-embed I-frames via standard Conv2d path
+        i_indices = [fi for fi in range(count) if is_i_frame[fi]]
+        i_embeddings: dict[int, torch.Tensor] = {}
+        if i_indices:
+            i_pv = pixel_values[i_indices]
+            i_embs = embeddings_mod(i_pv)
+            for local_idx, fi in enumerate(i_indices):
+                i_embeddings[fi] = i_embs[local_idx]
+
+        # Build packed tensor: full embeddings for I-frames,
+        # sparse embeddings for P-frames
+        packed_parts: list[torch.Tensor] = []
+        seqlens: list[int] = []
+
+        for fi in range(count):
+            if is_i_frame[fi]:
+                packed_parts.append(i_embeddings[fi])
+                seqlens.append(num_patches_plus_cls)
+            else:
+                sparse_emb = self._sparse_embed_p_frame(
+                    pixel_values[fi], encode_masks[fi], embeddings_mod)
+                packed_parts.append(sparse_emb)
+                seqlens.append(sparse_emb.size(0))
+
+        hidden = packed_parts[0].size(-1)
+        packed = torch.cat(packed_parts, dim=0).unsqueeze(0)
+        cu_seqlens = torch.zeros(
+            count + 1, dtype=torch.int32, device=device)
+        torch.cumsum(
+            torch.tensor(seqlens, dtype=torch.int32, device=device),
+            dim=0, out=cu_seqlens[1:])
+        max_seqlen = max(seqlens)
+
+        enc_out = self.vision_model(
+            pixel_embeds=packed,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+        enc_flat = enc_out.squeeze(0)
+
+        # Unpack, scatter (P-frames), project, and select
+        results: list[torch.Tensor] = []
+        offset = 0
+        for fi in range(count):
+            n = seqlens[fi]
+            frame_enc = enc_flat[offset:offset + n]
+            offset += n
+
+            if is_i_frame[fi]:
+                proj = self._project_single_frame(frame_enc)
+                results.append(proj)
+                if debug:
+                    logger.info(
+                        "InternVL codec sparse: frame=%s/%s I-frame "
+                        "(proj_tokens=%s, vit_tokens=%s).",
+                        fi, count - 1, proj.size(0), n)
+            else:
+                full = torch.zeros(num_patches_plus_cls, hidden,
+                                   dtype=frame_enc.dtype, device=device)
+                full[encode_masks[fi]] = frame_enc
+                proj = self._project_single_frame(full)
+                if codec_proj_mask is not None:
+                    keep_idx = codec_proj_mask[fi].nonzero(
+                        as_tuple=False).squeeze(-1)
+                    if keep_idx.numel() == 0:
+                        keep_idx = torch.zeros(
+                            1, dtype=torch.long, device=device)
+                    selected = proj.index_select(0, keep_idx)
+                else:
+                    selected = proj
+                results.append(selected)
+                if debug:
+                    logger.info(
+                        "InternVL codec sparse: frame=%s/%s P-frame "
+                        "(kept=%s/256, vit_tokens=%s/%s).",
+                        fi, count - 1, selected.size(0),
+                        n, num_patches_plus_cls)
+
+        return results
+
+    def _prune_with_similarity(
+        self,
+        seq_embeddings: torch.Tensor,
+        count: int,
+        *,
+        prune_ratio: float,
+        debug: bool,
+        frame_as_images_mode: bool,
+    ) -> list[torch.Tensor]:
+        """Single-anchor pruning using embedding similarity (fallback)."""
+        key_emb = seq_embeddings[0:1]
+        key_encoder_out = self.vision_model(pixel_embeds=key_emb)
+        key_projected = self._project_vit_embeddings(key_encoder_out)
+
+        if debug:
+            logger.info(
+                "InternVL prune: frame=0/%s key frame, "
+                "all recompute (tokens=%s).",
+                count - 1, key_emb.size(1))
+
+        first_out = key_projected
+        if frame_as_images_mode:
+            first_out = self._select_pruned_tokens(
+                key_projected, key_projected,
+                prune_ratio=prune_ratio)
+
+        if count == 1:
+            return [first_out.squeeze(0)]
+
+        results: list[torch.Tensor] = [first_out.squeeze(0)]
+
+        dynamic_indices: list[torch.Tensor] = []
+        for frame_idx in range(1, count):
+            emb = seq_embeddings[frame_idx:frame_idx + 1]
+            mask = build_prune_mask_from_embeddings(
+                emb, key_emb,
+                prune_ratio=prune_ratio, cls_index=0)
+            dyn_idx = (~mask[0]).nonzero(
+                as_tuple=False).squeeze(-1)
+            dynamic_indices.append(dyn_idx)
+
+            if debug:
+                num_tokens = mask.numel()
+                num_skip = int(mask.sum().item())
+                logger.info(
+                    "InternVL prune: frame=%s/%s "
+                    "prune_ratio=%.3f skip_ratio=%.3f "
+                    "(skip=%s, recompute=%s, tokens=%s)",
+                    frame_idx, count - 1, prune_ratio,
+                    num_skip / max(1, num_tokens),
+                    num_skip, num_tokens - num_skip, num_tokens)
+
+        frame_indices = list(range(1, count))
+        group_results = self._encode_anchor_group_packed(
+            seq_embeddings, key_encoder_out, key_projected,
+            frame_indices, dynamic_indices, prune_ratio)
+        for fi in frame_indices:
+            results.append(group_results[fi])
+
+        return results
 
     def _project_vit_embeddings(self, vit_embeds: torch.Tensor) -> torch.Tensor:
         vit_embeds = vit_embeds[:, 1:, :]
@@ -1448,6 +1911,13 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
         vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1,
                                         vit_embeds.shape[-1])
         return self.mlp1(vit_embeds)
+
+    def _project_single_frame(
+        self, frame_enc: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project a single frame's ViT output [1025, h] -> [256, llm_h]."""
+        return self._project_vit_embeddings(
+            frame_enc.unsqueeze(0)).squeeze(0)
 
     def extract_feature(
         self,
@@ -1479,6 +1949,10 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
         pixel_values_flat = kwargs.pop("pixel_values_flat", None)
         image_num_patches = kwargs.pop("image_num_patches", None)
         image_embeds = kwargs.pop("image_embeds", None)
+        codec_anchor_idx = kwargs.pop("codec_anchor_idx", None)
+        codec_prune_mask = kwargs.pop("codec_prune_mask", None)
+        codec_proj_mask = kwargs.pop("codec_proj_mask", None)
+        kwargs.pop("codec_kept_counts", None)
 
         if pixel_values_flat is None and image_embeds is None:
             return None
@@ -1515,6 +1989,9 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
                 type="pixel_values",
                 pixel_values_flat=pixel_values_flat,
                 num_patches=image_num_patches,
+                codec_anchor_idx=codec_anchor_idx,
+                codec_prune_mask=codec_prune_mask,
+                codec_proj_mask=codec_proj_mask,
                 resolve_bindings=resolve_bindings,
             )
 
@@ -1525,6 +2002,9 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
         pixel_values_flat_video = kwargs.pop("pixel_values_flat_video", None)
         video_num_patches = kwargs.pop("video_num_patches", None)
         video_embeds = kwargs.pop("image_embeds", None)
+        codec_anchor_idx = kwargs.pop("codec_anchor_idx", None)
+        codec_prune_mask = kwargs.pop("codec_prune_mask", None)
+        codec_proj_mask = kwargs.pop("codec_proj_mask", None)
 
         if pixel_values_flat_video is None and video_embeds is None:
             return None
@@ -1558,6 +2038,9 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
                 type="pixel_values_videos",
                 pixel_values_flat=pixel_values_flat_video,
                 num_patches=video_num_patches,
+                codec_anchor_idx=codec_anchor_idx,
+                codec_prune_mask=codec_prune_mask,
+                codec_proj_mask=codec_proj_mask,
                 resolve_bindings=resolve_bindings,
             )
 
@@ -1576,8 +2059,18 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
         prune_enabled = settings["enabled"] and image_input[
             "type"] in ("pixel_values_videos", "pixel_values")
         if prune_enabled:
+            codec_anchor_idx = getattr(
+                image_input, "codec_anchor_idx", None)
+            codec_prune_mask = getattr(
+                image_input, "codec_prune_mask", None)
+            codec_proj_mask = getattr(
+                image_input, "codec_proj_mask", None)
             image_embeds = self._extract_feature_with_prune(
-                image_input["pixel_values_flat"], image_input["num_patches"])
+                image_input["pixel_values_flat"],
+                image_input["num_patches"],
+                codec_anchor_idx=codec_anchor_idx,
+                codec_prune_mask=codec_prune_mask,
+                codec_proj_mask=codec_proj_mask)
         else:
             image_embeds = self.extract_feature(image_input["pixel_values_flat"],
                                                 image_input["num_patches"])

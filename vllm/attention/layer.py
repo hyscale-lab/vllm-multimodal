@@ -524,6 +524,70 @@ class MultiHeadAttention(nn.Module):
 
         return out.reshape(bsz, q_len, -1)
 
+    def forward_packed(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        """Packed variable-length attention for sequences with different lengths.
+
+        All sequences are concatenated into a single flat tensor with
+        cu_seqlens boundaries, analogous to continuous batching.
+
+        Args:
+            query/key/value: [1, total_len, hidden] or [total_len, hidden]
+            cu_seqlens: [num_seqs + 1] int32, cumulative sequence boundaries
+            max_seqlen: maximum sequence length across all packed sequences
+        Returns:
+            [1, total_len, num_heads * head_size]
+        """
+        total_len = query.shape[-2] if query.ndim == 3 else query.shape[0]
+        query = query.reshape(-1, self.num_heads, self.head_size)
+        key = key.reshape(-1, self.num_kv_heads, self.head_size)
+        value = value.reshape(-1, self.num_kv_heads, self.head_size)
+
+        if (num_repeat := self.num_queries_per_kv) > 1:
+            key = torch.repeat_interleave(key, num_repeat, dim=1)
+            value = torch.repeat_interleave(value, num_repeat, dim=1)
+
+        if self.attn_backend == _Backend.FLASH_ATTN:
+            out = self._flash_attn_varlen_func(
+                query,
+                key,
+                value,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                softmax_scale=self.scale,
+            )
+        elif self.attn_backend == _Backend.XFORMERS:
+            from xformers import ops as xops
+            from xformers.ops.fmha import BlockDiagonalMask
+
+            seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+            attn_bias = BlockDiagonalMask.from_seqlens(seqlens)
+            out = xops.memory_efficient_attention_forward(
+                query.unsqueeze(0),
+                key.unsqueeze(0),
+                value.unsqueeze(0),
+                attn_bias=attn_bias,
+                scale=self.scale,
+            ).squeeze(0)
+        else:
+            raise NotImplementedError(
+                f"Packed attention not supported for {self.attn_backend}. "
+                "Use FLASH_ATTN or XFORMERS backend.")
+
+        return out.reshape(1, total_len, -1)
+
+    @property
+    def supports_packed(self) -> bool:
+        return self.attn_backend in (_Backend.FLASH_ATTN, _Backend.XFORMERS)
+
 
 def wait_for_kv_layer_from_connector(layer_name: str):
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():

@@ -117,48 +117,6 @@ def build_prune_mask_from_embeddings(
     return prune_mask
 
 
-def apply_pruned_layer(
-    layer: "InternVisionEncoderLayer",
-    hidden_states: torch.Tensor,
-    *,
-    prune_mask: torch.Tensor,
-    cache: Optional[torch.Tensor],
-) -> torch.Tensor:
-    """Apply a block-sparse attention+FFN path with pruning.
-
-    Tokens with prune_mask=True are copied from cache; others are recomputed.
-    This is an aggressive approximation for experimental use.
-    """
-    if cache is None:
-        return layer(hidden_states)
-
-    if prune_mask.ndim == 1:
-        prune_mask = prune_mask.unsqueeze(0).expand(hidden_states.size(0), -1)
-
-    if prune_mask.shape[:2] != hidden_states.shape[:2]:
-        raise ValueError("prune_mask shape must match hidden_states.")
-
-    batch_size, num_tokens, _ = hidden_states.shape
-    outputs = cache.clone()
-
-    for batch_idx in range(batch_size):
-        recompute_mask = ~prune_mask[batch_idx]
-        if not torch.any(recompute_mask):
-            continue
-
-        recompute_idx = recompute_mask.nonzero(as_tuple=False).squeeze(-1)
-        x_small = hidden_states[batch_idx:batch_idx + 1, recompute_idx, :]
-
-        attn_out = layer.attn(layer.norm1(x_small)) * layer.ls1
-        x_small = x_small + attn_out
-        mlp_out = layer.mlp(layer.norm2(x_small)) * layer.ls2
-        x_small = x_small + mlp_out
-
-        outputs[batch_idx, recompute_idx, :] = x_small.squeeze(0)
-
-    return outputs
-
-
 class InternVisionEmbeddings(nn.Module):
 
     def __init__(self, config: PretrainedConfig):
@@ -236,7 +194,7 @@ class InternVisionPatchModel(nn.Module):
         pixel_embeds: Optional[torch.Tensor] = None,
         *,
         prune_mask: Optional[torch.Tensor] = None,
-        prune_cache: Optional[list[Optional[torch.Tensor]]] = None,
+        prune_cache: Optional[list] = None,
         prune_update_cache: bool = True,
     ) -> torch.FloatTensor:
         if pixel_values is None and pixel_embeds is None:
@@ -346,22 +304,20 @@ class InternParallelAttention(nn.Module):
         out, _ = self.proj(out)
         return out
 
-    def forward_pruned(
+    def forward_packed(
         self,
-        normed_full_hidden: torch.Tensor,
-        q_indices: torch.Tensor,
+        x: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
     ) -> torch.Tensor:
-        if q_indices.numel() == 0:
-            return normed_full_hidden[:, :0, :]
-
-        qkv, _ = self.qkv(normed_full_hidden)
-        q_full, k_full, v_full = qkv.chunk(3, dim=-1)
+        """Packed variable-length attention (continuous-batching style)."""
+        qkv, _ = self.qkv(x)
+        q, k, v = qkv.chunk(3, dim=-1)
 
         if self.qk_normalization:
-            q_full, k_full = self._apply_qk_norm(q_full, k_full)
+            q, k = self._apply_qk_norm(q, k)
 
-        q_dyn = q_full.index_select(1, q_indices)
-        out = self.attn(q_dyn, k_full, v_full)
+        out = self.attn.forward_packed(q, k, v, cu_seqlens, max_seqlen)
         out, _ = self.proj(out)
         return out
 
@@ -473,6 +429,20 @@ class InternVisionEncoderLayer(nn.Module):
 
         return hidden_states
 
+    def forward_packed(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ):
+        hidden_states = hidden_states + self.attn.forward_packed(
+            self.norm1(hidden_states), cu_seqlens, max_seqlen) * self.ls1
+
+        hidden_states = hidden_states + self.mlp(
+            self.norm2(hidden_states)) * self.ls2
+
+        return hidden_states
+
 
 class InternVisionEncoder(nn.Module):
 
@@ -508,78 +478,20 @@ class InternVisionEncoder(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         *,
-        prune_mask: Optional[torch.Tensor] = None,
-        prune_cache: Optional[list[Optional[torch.Tensor]]] = None,
-        prune_update_cache: bool = True,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
     ):
         hidden_states = inputs_embeds
-        if prune_mask is None or prune_cache is None:
+
+        if cu_seqlens is not None:
+            assert max_seqlen is not None
             for encoder_layer in self.layers:
-                hidden_states = encoder_layer(hidden_states)
+                hidden_states = encoder_layer.forward_packed(
+                    hidden_states, cu_seqlens, max_seqlen)
             return hidden_states
 
-        num_layers = len(self.layers)
-        if len(prune_cache) != num_layers:
-            raise ValueError("prune_cache length must match encoder layers.")
-        debug = os.environ.get("VLLM_INTERNVL_PRUNE_DEBUG", "0") == "1"
-        if debug:
-            logger.info(
-                "InternVL prune layers: total=%s",
-                num_layers,
-            )
-
-        if prune_mask.ndim == 1:
-            prune_mask = prune_mask.unsqueeze(0)
-
-        if prune_update_cache:
-            for layer_idx, encoder_layer in enumerate(self.layers):
-                if debug:
-                    cache_state = "hit" if prune_cache[
-                        layer_idx] is not None else "miss"
-                    logger.info("InternVL prune layer=%s cache=%s", layer_idx,
-                                cache_state)
-                hidden_states = apply_pruned_layer(
-                    encoder_layer,
-                    hidden_states,
-                    prune_mask=prune_mask,
-                    cache=prune_cache[layer_idx],
-                )
-                prune_cache[layer_idx] = hidden_states
-            return hidden_states
-
-        if prune_mask.shape[0] > 1 and not torch.equal(
-                prune_mask, prune_mask[0:1].expand_as(prune_mask)):
-            raise NotImplementedError(
-                "Per-example prune masks are not supported with compact "
-                "hidden states.")
-
-        dynamic_idx = (~prune_mask[0]).nonzero(as_tuple=False).squeeze(-1)
-        if dynamic_idx.numel() == 0:
-            return hidden_states[:, :0, :]
-
-        hidden_states = hidden_states.index_select(1, dynamic_idx)
-        for layer_idx, encoder_layer in enumerate(self.layers):
-            cache = prune_cache[layer_idx]
-            if cache is None:
-                raise ValueError(
-                    "Prune cache is missing for compact pruning.")
-
-            # If all tokens are dynamic, compact pruning degenerates to the
-            # regular layer forward; avoid clone/index_copy overhead.
-            if dynamic_idx.numel() == cache.shape[1]:
-                hidden_states = encoder_layer(hidden_states)
-                continue
-
-            full_hidden = cache.clone()
-            full_hidden.index_copy_(1, dynamic_idx, hidden_states)
-            normed_full = encoder_layer.norm1(full_hidden)
-            attn_out = encoder_layer.attn.forward_pruned(
-                normed_full, dynamic_idx) * encoder_layer.ls1
-            hidden_states = hidden_states + attn_out
-            mlp_out = encoder_layer.mlp(
-                encoder_layer.norm2(hidden_states)) * encoder_layer.ls2
-            hidden_states = hidden_states + mlp_out
-
+        for encoder_layer in self.layers:
+            hidden_states = encoder_layer(hidden_states)
         return hidden_states
 
 
@@ -622,9 +534,8 @@ class InternVisionModel(nn.Module):
         pixel_values: Optional[torch.Tensor] = None,
         pixel_embeds: Optional[torch.Tensor] = None,
         *,
-        prune_mask: Optional[torch.Tensor] = None,
-        prune_cache: Optional[list[Optional[torch.Tensor]]] = None,
-        prune_update_cache: bool = True,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
     ) -> torch.FloatTensor:
         if pixel_values is None and pixel_embeds is None:
             raise ValueError(
@@ -640,17 +551,17 @@ class InternVisionModel(nn.Module):
                     f'wrong pixel_values size: {pixel_values.shape}')
 
         if self.use_data_parallel:
-            if prune_mask is not None:
+            if cu_seqlens is not None:
                 raise NotImplementedError(
-                    "Pruning is not supported with data-parallel sharding.")
+                    "Packed mode is not supported with "
+                    "data-parallel sharding.")
             encoder_outputs = run_dp_sharded_vision_model(
                 hidden_states, self.encoder)
         else:
             encoder_outputs = self.encoder(
                 inputs_embeds=hidden_states,
-                prune_mask=prune_mask,
-                prune_cache=prune_cache,
-                prune_update_cache=prune_update_cache,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
             )
 
         return encoder_outputs

@@ -994,14 +994,10 @@ class Scheduler(SchedulerInterface):
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
                         kv_transfer_params=kv_transfer_params,
-                        mm_encoder_latency_ms=mm_encoder_latency_ms.get(
-                            req_id,
-                            getattr(request, "mm_encoder_latency_ms", None)),
-                        decoder_prefill_latency_ms=(
-                            decoder_prefill_latency_ms.get(
-                                req_id, getattr(request,
-                                                "decoder_prefill_latency_ms",
-                                                None))),
+                        mm_encoder_latency_ms=getattr(
+                            request, "mm_encoder_latency_ms", None),
+                        decoder_prefill_latency_ms=getattr(
+                            request, "decoder_prefill_latency_ms", None),
                         trace_headers=request.trace_headers,
                         num_cached_tokens=request.num_cached_tokens,
                     ))
