@@ -84,6 +84,9 @@ def _get_internvl_prune_settings() -> dict[str, object]:
     }
 
 
+_EXPAND_PROMPT = os.environ.get("VLLM_INTERNVL_EXPAND_PROMPT", "1") == "1"
+
+
 class InternVLImagePixelInputs(TensorSchema):
     """
     Dimensions:
@@ -479,12 +482,62 @@ class BaseInternVLProcessor(ABC):
 
         return num_patches * self.num_image_token
 
+    def _batch_images_to_pixel_values(
+        self,
+        images: list[Image.Image],
+        input_size: int,
+        codec_frame_info: Optional[list[dict]] = None,
+    ) -> list[torch.Tensor]:
+        """Batch-resize all images using torch F.interpolate.
+
+        All images must be the same resolution (video frames from a
+        single source).  Returns a list of [1, 3, input_size, input_size]
+        tensors -- the same format as the per-image PIL path.
+
+        Args:
+            codec_frame_info: per-frame codec metadata from the client.
+                Currently used for logging; GPU-side _sparse_embed_p_frame
+                handles actual sparse patch extraction.
+        """
+        n = len(images)
+        np_images = [np.asarray(convert_image_mode(img, 'RGB'))
+                     for img in images]
+        batch_np = np.stack(np_images)
+        batch_t = torch.from_numpy(batch_np).permute(0, 3, 1, 2)
+
+        use_gpu = torch.cuda.is_available()
+        device = torch.device('cuda' if use_gpu else 'cpu')
+        batch_t = batch_t.to(device=device, dtype=torch.float32).div_(255.0)
+
+        resized = F.interpolate(
+            batch_t, size=(input_size, input_size),
+            mode='bicubic', align_corners=False,
+        ).clamp_(0.0, 1.0)
+
+        mean = torch.tensor(IMAGENET_MEAN, device=device,
+                            dtype=torch.float32).view(1, 3, 1, 1)
+        std = torch.tensor(IMAGENET_STD, device=device,
+                           dtype=torch.float32).view(1, 3, 1, 1)
+        normalized = resized.sub_(mean).div_(std)
+
+        if use_gpu:
+            normalized = normalized.cpu()
+
+        logger.info(
+            "Batch pixel preprocessing: %d frames, device=%s, "
+            "codec_info=%s",
+            n, device.type,
+            "yes" if codec_frame_info else "no")
+
+        return [normalized[i:i + 1] for i in range(n)]
+
     def _images_to_pixel_values_lst(
         self,
         images: list[Image.Image],
         min_dynamic_patch: Optional[int] = None,
         max_dynamic_patch: Optional[int] = None,
         dynamic_image_size: Optional[bool] = None,
+        codec_frame_info: Optional[list[dict]] = None,
     ) -> list[torch.Tensor]:
         min_num, max_num = self.resolve_min_max_num(
             min_dynamic_patch=min_dynamic_patch,
@@ -492,6 +545,13 @@ class BaseInternVLProcessor(ABC):
             dynamic_image_size=dynamic_image_size,
             use_thumbnail=False,  # Applied in image_to_pixel_values
         )
+
+        if (min_num == 1 and max_num == 1
+                and len(images) > 1
+                and len({img.size for img in images}) == 1):
+            return self._batch_images_to_pixel_values(
+                images, self.image_size,
+                codec_frame_info=codec_frame_info)
 
         return [
             image_to_pixel_values_internvl(
@@ -520,6 +580,7 @@ class BaseInternVLProcessor(ABC):
                 min_dynamic_patch=min_dynamic_patch,
                 max_dynamic_patch=max_dynamic_patch,
                 dynamic_image_size=dynamic_image_size,
+                codec_frame_info=codec_frame_info,
             )
             image_inputs: dict[str, NestedTensors] = {
                 "pixel_values_flat":
@@ -1100,14 +1161,12 @@ class InternVLMultiModalProcessor(
     def _cached_apply_hf_processor(self, prompt, mm_data_items,
                                    hf_processor_mm_kwargs,
                                    tokenization_kwargs, **kwargs):
-        codec_frame_info = hf_processor_mm_kwargs.get("codec_frame_info")
-        if codec_frame_info is None:
-            return super()._cached_apply_hf_processor(
-                prompt, mm_data_items, hf_processor_mm_kwargs,
-                tokenization_kwargs, **kwargs)
-
         cache = self.cache
         _, passthrough_data = self._get_hf_mm_data(mm_data_items)
+        logger.info("[EXPAND_PROMPT] cache=%s, passthrough=%s, expand=%s, "
+                    "prompt_type=%s",
+                    cache is not None, bool(passthrough_data), _EXPAND_PROMPT,
+                    type(prompt).__name__)
         if cache is None or passthrough_data:
             return self._apply_hf_processor(
                 prompt=prompt,
@@ -1115,6 +1174,8 @@ class InternVLMultiModalProcessor(
                 hf_processor_mm_kwargs=hf_processor_mm_kwargs,
                 tokenization_kwargs=tokenization_kwargs,
                 **kwargs)
+
+        codec_frame_info = hf_processor_mm_kwargs.get("codec_frame_info")
 
         mm_hashes = self._hash_mm_items(
             mm_data_items, hf_processor_mm_kwargs,
@@ -1137,14 +1198,16 @@ class InternVLMultiModalProcessor(
                 mm_data_items[modality][idx] for idx in idxs]
         mm_missing_data_items = self._to_mm_items(mm_missing_data)
 
-        image_missing_idxs = mm_missing_idxs.get("image", [])
-        filtered_codec = ([codec_frame_info[i] for i in image_missing_idxs]
-                          if image_missing_idxs else None)
         filtered_kwargs = dict(hf_processor_mm_kwargs)
-        if filtered_codec:
-            filtered_kwargs["codec_frame_info"] = filtered_codec
-        else:
-            filtered_kwargs.pop("codec_frame_info", None)
+        if codec_frame_info is not None:
+            image_missing_idxs = mm_missing_idxs.get("image", [])
+            filtered_codec = ([codec_frame_info[i]
+                               for i in image_missing_idxs]
+                              if image_missing_idxs else None)
+            if filtered_codec:
+                filtered_kwargs["codec_frame_info"] = filtered_codec
+            else:
+                filtered_kwargs.pop("codec_frame_info", None)
 
         (
             prompt_ids,
@@ -1175,6 +1238,27 @@ class InternVLMultiModalProcessor(
             mm_missing_kwargs=mm_missing_kwargs,
             mm_missing_prompt_updates=mm_missing_prompt_updates,
         )
+
+        if _EXPAND_PROMPT:
+            tokenizer = self.info.get_tokenizer()
+            if isinstance(prompt, str):
+                expanded_text = prompt
+            else:
+                expanded_text = tokenizer.decode(prompt_ids)
+            for modality in ("image", "video"):
+                if modality not in mm_prompt_updates:
+                    continue
+                for item_updates in mm_prompt_updates[modality]:
+                    for update in item_updates:
+                        target = update.target
+                        repl = update.content.full
+                        if isinstance(target, str) and isinstance(repl, str):
+                            expanded_text = expanded_text.replace(
+                                target, repl, 1)
+                        break
+            prompt_ids = tokenizer.encode(expanded_text,
+                                          add_special_tokens=False)
+            is_update_applied = True
 
         mm_info = MultiModalProcessingInfo(
             kwargs=mm_kwargs,
@@ -1581,13 +1665,14 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
         codec_prune_mask: Optional[torch.Tensor] = None,
         codec_proj_mask: Optional[torch.Tensor] = None,
     ) -> list[torch.Tensor]:
+        has_codec = (codec_anchor_idx is not None
+                     and codec_prune_mask is not None)
+
         settings = self._get_prune_settings()
-        if not settings["enabled"]:
+        if not settings["enabled"] and not has_codec:
             return self.extract_feature(pixel_values)
 
         debug = bool(settings.get("debug", False))
-        has_codec = (codec_anchor_idx is not None
-                     and codec_prune_mask is not None)
 
         all_embeddings = None
         if not has_codec:
