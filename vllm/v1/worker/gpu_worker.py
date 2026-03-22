@@ -215,7 +215,9 @@ class Worker(WorkerBase):
         with self._maybe_get_memory_pool_context(tag="weights"):
             self.model_runner.load_model(eep_scale_up=eep_scale_up)
         VLLMModelTracker.register_model(ENGINE_NAME, self.model_runner.model)
-        ensure_kv_transfer_initialized(self.vllm_config)     
+        VLLMModelTracker.register_encoder_cache(
+            ENGINE_NAME, self.model_runner.encoder_cache)
+        ensure_kv_transfer_initialized(self.vllm_config)
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)

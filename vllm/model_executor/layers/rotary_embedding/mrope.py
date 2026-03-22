@@ -630,14 +630,23 @@ class MRotaryEmbedding(RotaryEmbedding):
 
         image_index, video_index = 0, 0
         for _ in range(image_nums + video_nums):
-            if image_token_id in input_tokens and remain_images > 0:
-                ed_image = input_tokens.index(image_token_id, st)
+            if remain_images > 0:
+                try:
+                    ed_image = input_tokens.index(image_token_id, st)
+                except ValueError:
+                    ed_image = len(input_tokens) + 1
             else:
                 ed_image = len(input_tokens) + 1
-            if video_token_id in input_tokens and remain_videos > 0:
-                ed_video = input_tokens.index(video_token_id, st)
+            if remain_videos > 0:
+                try:
+                    ed_video = input_tokens.index(video_token_id, st)
+                except ValueError:
+                    ed_video = len(input_tokens) + 1
             else:
                 ed_video = len(input_tokens) + 1
+            _sentinel = len(input_tokens) + 1
+            if ed_image >= _sentinel and ed_video >= _sentinel:
+                break
             if ed_image < ed_video:
                 t, h, w = (
                     image_grid_thw[image_index][0],
@@ -647,7 +656,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                 image_index += 1
                 remain_images -= 1
                 ed = ed_image
-            else:
+            elif ed_video < _sentinel:
                 t, h, w = (
                     video_grid_thw[video_index][0],
                     video_grid_thw[video_index][1],
@@ -656,6 +665,8 @@ class MRotaryEmbedding(RotaryEmbedding):
                 video_index += 1
                 remain_videos -= 1
                 ed = ed_video
+            else:
+                break
 
             llm_grid_t, llm_grid_h, llm_grid_w = \
                 t, h // spatial_merge_size, w // spatial_merge_size

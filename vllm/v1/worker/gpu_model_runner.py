@@ -1538,17 +1538,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         return mm_kwargs, mm_hashes_pos
 
     def _execute_mm_encoder(
-            self, scheduler_output: "SchedulerOutput") -> Optional[float]:
+            self, scheduler_output: "SchedulerOutput") -> None:
         # Batch the multi-modal inputs using the helper method.
         mm_kwargs, mm_hashes_pos = self._batch_mm_kwargs_from_scheduler(
             scheduler_output)
 
         if not mm_kwargs:
-            return None
-
-        mm_encoder_start = torch.cuda.Event(enable_timing=True)
-        mm_encoder_end = torch.cuda.Event(enable_timing=True)
-        mm_encoder_start.record()
+            return
 
         # Batch mm inputs as much as we can: if a request in the batch has
         # multiple modalities or a different modality than the previous one,
@@ -1607,9 +1603,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 output,
                 is_embed=pos_info.is_embed,
             )
-        mm_encoder_end.record()
-        mm_encoder_end.synchronize()
-        return mm_encoder_start.elapsed_time(mm_encoder_end)
 
     def _gather_mm_embeddings(
         self,
@@ -1978,8 +1971,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         mm_encoder_latency_ms: Optional[float] = None
         if (self.supports_mm_inputs and get_pp_group().is_first_rank
                 and not self.model_config.is_encoder_decoder):
+            _has_encoder_inputs = bool(
+                scheduler_output.scheduled_encoder_inputs)
+
+            if _has_encoder_inputs:
+                _mm_ev_start = torch.cuda.Event(enable_timing=True)
+                _mm_ev_end = torch.cuda.Event(enable_timing=True)
+                _mm_ev_start.record()
+
             # Run the multimodal encoder if any.
-            mm_encoder_latency_ms = self._execute_mm_encoder(scheduler_output)
+            self._execute_mm_encoder(scheduler_output)
             mm_embeds = self._gather_mm_embeddings(scheduler_output)
 
             # NOTE(woosuk): To unify token ids and soft tokens (vision
@@ -1993,6 +1994,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # TODO(woosuk): Avoid the copy. Optimize.
             self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(
                 inputs_embeds_scheduled)
+
+            if _has_encoder_inputs:
+                _mm_ev_end.record()
+                _mm_ev_end.synchronize()
+                mm_encoder_latency_ms = _mm_ev_start.elapsed_time(
+                    _mm_ev_end)
 
             input_ids = None
             inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]

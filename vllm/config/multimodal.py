@@ -125,5 +125,8 @@ class MultiModalConfig:
         return kwargs | dict(inference_kwargs)
 
     def is_multimodal_pruning_enabled(self):
-        return (self.video_pruning_rate is not None
-                and self.video_pruning_rate > 0)
+        import os
+        codec_prune = os.environ.get("VLLM_QWEN3VL_PRUNE", "0") == "1"
+        return (codec_prune
+                or (self.video_pruning_rate is not None
+                    and self.video_pruning_rate > 0))

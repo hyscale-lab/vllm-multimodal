@@ -67,24 +67,17 @@ logger = init_logger(__name__)
 def _get_internvl_prune_settings() -> dict[str, object]:
     enabled = (os.environ.get("VLLM_INTERNVL_PRUNE", "0") == "1"
                or os.environ.get("VLLM_INTERNVL_REUSE", "0") == "1")
-    prune_ratio = float(
-        os.environ.get(
-            "VLLM_INTERNVL_PRUNE_RATIO",
-            os.environ.get("VLLM_INTERNVL_REUSE_RECOMPUTE_RATIO", "0.2"),
-        ))
     debug = (os.environ.get("VLLM_INTERNVL_PRUNE_DEBUG", "0") == "1"
              or os.environ.get("VLLM_INTERNVL_REUSE_DEBUG", "0") == "1")
     disable_batching = (
         os.environ.get("VLLM_INTERNVL_DISABLE_BATCHING", "0") == "1")
     return {
         "enabled": enabled,
-        "prune_ratio": prune_ratio,
         "debug": debug,
         "disable_batching": disable_batching,
     }
 
 
-_EXPAND_PROMPT = os.environ.get("VLLM_INTERNVL_EXPAND_PROMPT", "1") == "1"
 
 
 class InternVLImagePixelInputs(TensorSchema):
@@ -453,15 +446,6 @@ class BaseInternVLProcessor(ABC):
 
         return get_internvl_target_ratios(min_num, max_num)
 
-    def _get_kept_tokens_per_frame(self) -> Optional[int]:
-        settings = _get_internvl_prune_settings()
-        if not settings["enabled"]:
-            return None
-        prune_ratio = float(settings["prune_ratio"])
-        prune_ratio = max(0.0, min(1.0, prune_ratio))
-        # prune_ratio is the fraction removed; keep the remainder.
-        return max(0, int(round(self.num_image_token * (1.0 - prune_ratio))))
-
     def get_num_image_tokens(
         self,
         *,
@@ -589,12 +573,6 @@ class BaseInternVLProcessor(ABC):
                 torch.tensor([len(item) for item in pixel_values_lst]),
             }
 
-            kept_tokens = self._get_kept_tokens_per_frame()
-            use_image_sequence_prune = (
-                kept_tokens is not None
-                and len(pixel_values_lst) > 1
-                and all(item.shape[0] == 1 for item in pixel_values_lst))
-
             for item_idx, pixel_values in enumerate(pixel_values_lst):
                 num_patches = pixel_values.shape[0]
                 feature_size = num_patches * self.num_image_token
@@ -603,14 +581,6 @@ class BaseInternVLProcessor(ABC):
                         item_idx < len(codec_frame_info):
                     feature_size = int(
                         codec_frame_info[item_idx]["kept_count"])
-                elif kept_tokens is not None:
-                    if use_image_sequence_prune:
-                        feature_size = kept_tokens
-                    else:
-                        feature_size = (
-                            kept_tokens if num_patches == 1 else
-                            (self.num_image_token
-                             + max(num_patches - 1, 0) * kept_tokens))
 
                 image_repl = self.get_image_repl(feature_size, num_patches)
                 text = [t.replace('<image>', image_repl.full, 1) for t in text]
@@ -808,13 +778,7 @@ class InternVLProcessor(BaseInternVLProcessor):
         if per_frame_counts is not None:
             frame_token_counts = per_frame_counts
         else:
-            kept_tokens = self._get_kept_tokens_per_frame()
-            if kept_tokens is None:
-                frame_token_counts = [self.num_image_token] * num_patches
-            else:
-                frame_token_counts = [self.num_image_token] + [
-                    kept_tokens for _ in range(max(num_patches - 1, 0))
-                ]
+            frame_token_counts = [self.num_image_token] * num_patches
 
         repl_full = ''.join([
             f'Frame{i+1}: {IMG_START}'
@@ -979,16 +943,6 @@ class BaseInternVLMultiModalProcessor(BaseMultiModalProcessor[_I]):
 
         settings = _get_internvl_prune_settings()
         prune_enabled = bool(settings["enabled"])
-        prune_ratio = float(settings["prune_ratio"])
-        prune_ratio = max(0.0, min(1.0, prune_ratio))
-        kept_tokens_per_patch = max(
-            0, int(round(hf_processor.num_image_token * (1.0 - prune_ratio))))
-        # Frame-as-images mode: many image items where each item has one patch.
-        # These are processed as one temporal sequence in the encoder.
-        image_sequence_mode = (
-            prune_enabled
-            and len(image_num_patches) > 1
-            and all((p == 1) for p in image_num_patches if p is not None))
 
         img_codec_kept_t = out_mm_data.get("codec_kept_counts")
         img_codec_kept: Optional[list[int]] = None
@@ -1007,15 +961,7 @@ class BaseInternVLMultiModalProcessor(BaseMultiModalProcessor[_I]):
                 feature_size = int(img_codec_kept[item_idx])
             else:
                 num_patches = image_num_patches[item_idx]
-                if num_patches is not None and prune_enabled:
-                    if image_sequence_mode:
-                        feature_size = kept_tokens_per_patch
-                    else:
-                        feature_size = (
-                            kept_tokens_per_patch if num_patches == 1 else
-                            (hf_processor.num_image_token
-                             + max(num_patches - 1, 0) * kept_tokens_per_patch))
-                elif num_patches is not None:
+                if num_patches is not None:
                     feature_size = num_patches * hf_processor.num_image_token
                 else:
                     image_size = images.get_image_size(item_idx)
@@ -1163,10 +1109,6 @@ class InternVLMultiModalProcessor(
                                    tokenization_kwargs, **kwargs):
         cache = self.cache
         _, passthrough_data = self._get_hf_mm_data(mm_data_items)
-        logger.info("[EXPAND_PROMPT] cache=%s, passthrough=%s, expand=%s, "
-                    "prompt_type=%s",
-                    cache is not None, bool(passthrough_data), _EXPAND_PROMPT,
-                    type(prompt).__name__)
         if cache is None or passthrough_data:
             return self._apply_hf_processor(
                 prompt=prompt,
@@ -1239,26 +1181,25 @@ class InternVLMultiModalProcessor(
             mm_missing_prompt_updates=mm_missing_prompt_updates,
         )
 
-        if _EXPAND_PROMPT:
-            tokenizer = self.info.get_tokenizer()
-            if isinstance(prompt, str):
-                expanded_text = prompt
-            else:
-                expanded_text = tokenizer.decode(prompt_ids)
-            for modality in ("image", "video"):
-                if modality not in mm_prompt_updates:
-                    continue
-                for item_updates in mm_prompt_updates[modality]:
-                    for update in item_updates:
-                        target = update.target
-                        repl = update.content.full
-                        if isinstance(target, str) and isinstance(repl, str):
-                            expanded_text = expanded_text.replace(
-                                target, repl, 1)
-                        break
-            prompt_ids = tokenizer.encode(expanded_text,
-                                          add_special_tokens=False)
-            is_update_applied = True
+        tokenizer = self.info.get_tokenizer()
+        if isinstance(prompt, str):
+            expanded_text = prompt
+        else:
+            expanded_text = tokenizer.decode(prompt_ids)
+        for modality in ("image", "video"):
+            if modality not in mm_prompt_updates:
+                continue
+            for item_updates in mm_prompt_updates[modality]:
+                for update in item_updates:
+                    target = update.target
+                    repl = update.content.full
+                    if isinstance(target, str) and isinstance(repl, str):
+                        expanded_text = expanded_text.replace(
+                            target, repl, 1)
+                    break
+        prompt_ids = tokenizer.encode(expanded_text,
+                                      add_special_tokens=False)
+        is_update_applied = True
 
         mm_info = MultiModalProcessingInfo(
             kwargs=mm_kwargs,
