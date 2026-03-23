@@ -771,7 +771,13 @@ class Scheduler(SchedulerInterface):
                 continue
             elif start_pos + num_encoder_tokens <= num_computed_tokens:
                 # The encoder input is already computed and stored
-                # in the decoder's KV cache.
+                # in the decoder's KV cache.  Maintain the cache
+                # reference so the entry is not evicted while KV
+                # connectors (e.g. LMCache blending) may still need
+                # the encoder output for overlapping prefixes.
+                if not self.is_encoder_decoder:
+                    self.encoder_cache_manager.check_and_update_cache(
+                        request, i)
                 continue
 
             if not self.is_encoder_decoder:
