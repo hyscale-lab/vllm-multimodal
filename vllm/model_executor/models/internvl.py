@@ -1181,32 +1181,38 @@ class InternVLMultiModalProcessor(
             mm_missing_prompt_updates=mm_missing_prompt_updates,
         )
 
-        tokenizer = self.info.get_tokenizer()
-        if isinstance(prompt, str):
-            expanded_text = prompt
-        else:
-            expanded_text = tokenizer.decode(prompt_ids)
-        for modality in ("image", "video"):
-            if modality not in mm_prompt_updates:
-                continue
-            for item_updates in mm_prompt_updates[modality]:
-                for update in item_updates:
-                    target = update.target
-                    repl = update.content.full
-                    if isinstance(target, str) and isinstance(repl, str):
-                        expanded_text = expanded_text.replace(
-                            target, repl, 1)
-                    break
-        prompt_ids = tokenizer.encode(expanded_text,
-                                      add_special_tokens=False)
-        is_update_applied = True
-
         mm_info = MultiModalProcessingInfo(
             kwargs=mm_kwargs,
             hashes=mm_hashes,
             prompt_updates=mm_prompt_updates,
         )
-        return prompt_ids, mm_info, is_update_applied
+
+        if is_update_applied:
+            return prompt_ids, mm_info, is_update_applied
+
+        tokenizer = self.info.get_tokenizer()
+        expanded_text = (prompt if isinstance(prompt, str)
+                         else tokenizer.decode(prompt_ids))
+
+        for modality in ("image", "video"):
+            if modality not in mm_prompt_updates:
+                continue
+            for item_updates in mm_prompt_updates[modality]:
+                if not item_updates:
+                    continue
+                update = item_updates[0]
+                target = update.target
+                repl = update.content.full
+                if (not isinstance(target, str)
+                        or not isinstance(repl, str)):
+                    return prompt_ids, mm_info, is_update_applied
+                if target not in expanded_text:
+                    return prompt_ids, mm_info, is_update_applied
+                expanded_text = expanded_text.replace(target, repl, 1)
+
+        prompt_ids = tokenizer.encode(expanded_text,
+                                      add_special_tokens=False)
+        return prompt_ids, mm_info, True
 
     def _call_hf_processor(
         self,
