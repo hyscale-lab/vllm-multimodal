@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
+import os
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Annotated, Final, Literal, Optional, Protocol, Union
 
@@ -17,9 +18,11 @@ from vllm.model_executor.layers.activation import get_act_fn
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (MultiModalDataDict, MultiModalFieldConfig,
                                     MultiModalKwargsItems)
+from vllm.multimodal.hasher import MultiModalHasher
 from vllm.multimodal.parse import (ImageSize, MultiModalDataItems,
                                    VideoEmbeddingItems, VideoProcessorItems)
-from vllm.multimodal.processing import PromptReplacement, PromptUpdate
+from vllm.multimodal.processing import (MultiModalProcessingInfo,
+                                        PromptReplacement, PromptUpdate)
 from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
@@ -35,6 +38,26 @@ from .utils import (AutoWeightsLoader, WeightsMapper, flatten_bn,
 
 # For profile run
 _MAX_FRAMES_PER_VIDEO = 16
+
+# Number of codec-selectable visual tokens per SINGLE-TILE image: 27x27 = 729
+# SigLIP patches (no image-path pooling). The trailing image_newline token is
+# always kept and is NOT part of the selectable proj grid, so the model emits
+# kept_count + 1 tokens per single-tile image.
+_LLAVA_NUM_PROJ_TOKENS = 729
+
+
+def _get_llava_prune_settings() -> dict[str, object]:
+    """Read VLLM_LLAVA_PRUNE env gate (mirror of InternVL's settings).
+
+    Actual pruning triggers only when this is enabled AND codec data is
+    present in the request (see ``has_codec`` checks below).
+    """
+    enabled = os.environ.get("VLLM_LLAVA_PRUNE", "0") == "1"
+    debug = os.environ.get("VLLM_LLAVA_PRUNE_DEBUG", "0") == "1"
+    return {
+        "enabled": enabled,
+        "debug": debug,
+    }
 
 
 class LlavaOnevisionVideoPixelInputs(TensorSchema):
@@ -78,6 +101,12 @@ class LlavaOnevisionImagePixelInputs(TensorSchema):
     ]
 
     image_sizes: Annotated[Optional[torch.Tensor], TensorShape("bn", 2)]
+
+    # Codec-guided pruning metadata (optional; present only when the request
+    # carries codec_frame_info and VLLM_LLAVA_PRUNE is enabled). One row per
+    # image: proj_mask over the 27x27 SigLIP grid + kept_count.
+    codec_proj_mask: Optional[torch.Tensor] = None  # [num_images, 729]
+    codec_kept_counts: Optional[torch.Tensor] = None  # [num_images]
 
 
 class LlavaOnevisionImageEmbeddingInputs(TensorSchema):
@@ -283,17 +312,162 @@ class LlavaOnevisionDummyInputsBuilder(
 class LlavaOnevisionMultiModalProcessor(
         BaseLlavaNextMultiModalProcessor[LlavaOnevisionProcessingInfo]):
 
+    def _hash_mm_items(self, mm_items, hf_processor_mm_kwargs,
+                       tokenization_kwargs, **kwargs):
+        # Fold per-frame kept_count into the per-item cache key so that the
+        # same pixels with different codec masks do not collide in the MM
+        # cache (mirror of InternVL._hash_mm_items).
+        codec_info = hf_processor_mm_kwargs.get("codec_frame_info")
+        clean_kwargs = {k: v for k, v in hf_processor_mm_kwargs.items()
+                        if k != "codec_frame_info"}
+        if codec_info is None:
+            return super()._hash_mm_items(
+                mm_items, clean_kwargs, tokenization_kwargs, **kwargs)
+
+        kept_counts = [f.get("kept_count") for f in codec_info]
+        model_id = self.info.model_id
+        hashes: dict[str, list[str]] = {}
+        for modality, items in mm_items.items():
+            modality_hashes: list[str] = []
+            for i, item in enumerate(items):
+                per_item_kw = dict(clean_kwargs)
+                if modality == "image" and i < len(kept_counts):
+                    # One codec entry per image (one frame per image).
+                    per_item_kw["_codec_kept"] = kept_counts[i]
+                modality_hashes.append(
+                    MultiModalHasher.hash_kwargs(
+                        model_id=model_id,
+                        **{modality: item},
+                        **per_item_kw,
+                        **tokenization_kwargs))
+            hashes[modality] = modality_hashes
+        return hashes
+
+    def _cached_apply_hf_processor(self, prompt, mm_data_items,
+                                   hf_processor_mm_kwargs,
+                                   tokenization_kwargs, **kwargs):
+        cache = self.cache
+        _, passthrough_data = self._get_hf_mm_data(mm_data_items)
+        codec_frame_info = hf_processor_mm_kwargs.get("codec_frame_info")
+        if cache is None or passthrough_data or codec_frame_info is None:
+            return super()._cached_apply_hf_processor(
+                prompt=prompt,
+                mm_data_items=mm_data_items,
+                hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+                tokenization_kwargs=tokenization_kwargs,
+                **kwargs)
+
+        mm_hashes = self._hash_mm_items(
+            mm_data_items, hf_processor_mm_kwargs,
+            tokenization_kwargs, **kwargs)
+
+        mm_is_cached = {
+            modality: cache.is_cached(hashes)
+            for modality, hashes in mm_hashes.items()
+        }
+        mm_missing_idxs: dict[str, list[int]] = {
+            modality: [
+                idx for idx, is_cached
+                in enumerate(items_is_cached) if not is_cached
+            ]
+            for modality, items_is_cached in mm_is_cached.items()
+        }
+        mm_missing_data: dict[str, list] = {}
+        for modality, idxs in mm_missing_idxs.items():
+            mm_missing_data[modality] = [
+                mm_data_items[modality][idx] for idx in idxs]
+        mm_missing_data_items = self._to_mm_items(mm_missing_data)
+
+        # Codec masks are per-image; re-filter to the cache-missing images so
+        # they stay positionally aligned (mirror of InternVL).
+        filtered_kwargs = dict(hf_processor_mm_kwargs)
+        image_missing_idxs = mm_missing_idxs.get("image", [])
+        filtered_codec = ([codec_frame_info[i] for i in image_missing_idxs]
+                          if image_missing_idxs else None)
+        if filtered_codec:
+            filtered_kwargs["codec_frame_info"] = filtered_codec
+        else:
+            filtered_kwargs.pop("codec_frame_info", None)
+
+        (
+            prompt_ids,
+            mm_missing_processed_data,
+            is_update_applied,
+        ) = self._apply_hf_processor_main(
+            prompt=prompt,
+            mm_items=mm_missing_data_items,
+            hf_processor_mm_kwargs=filtered_kwargs,
+            tokenization_kwargs=tokenization_kwargs,
+            enable_hf_prompt_update=False,
+        )
+
+        mm_missing_kwargs = MultiModalKwargsItems.from_hf_inputs(
+            mm_missing_processed_data,
+            self._get_mm_fields_config(mm_missing_processed_data,
+                                       hf_processor_mm_kwargs),
+        )
+        mm_missing_prompt_updates = self._get_mm_prompt_updates(
+            mm_missing_data_items,
+            hf_processor_mm_kwargs,
+            mm_missing_kwargs,
+        )
+
+        mm_kwargs, mm_prompt_updates = self._merge_mm_kwargs(
+            cache,
+            mm_hashes=mm_hashes,
+            mm_missing_kwargs=mm_missing_kwargs,
+            mm_missing_prompt_updates=mm_missing_prompt_updates,
+        )
+
+        mm_info = MultiModalProcessingInfo(
+            kwargs=mm_kwargs,
+            hashes=mm_hashes,
+            prompt_updates=mm_prompt_updates,
+        )
+
+        if is_update_applied:
+            return prompt_ids, mm_info, is_update_applied
+
+        tokenizer = self.info.get_tokenizer()
+        expanded_text = (prompt if isinstance(prompt, str)
+                         else tokenizer.decode(prompt_ids))
+
+        for modality in ("image", "video"):
+            if modality not in mm_prompt_updates:
+                continue
+            for item_updates in mm_prompt_updates[modality]:
+                if not item_updates:
+                    continue
+                update = item_updates[0]
+                target = update.target
+                repl = update.content.full
+                if (not isinstance(target, str)
+                        or not isinstance(repl, str)):
+                    return prompt_ids, mm_info, is_update_applied
+                if target not in expanded_text:
+                    return prompt_ids, mm_info, is_update_applied
+                expanded_text = expanded_text.replace(target, repl, 1)
+
+        prompt_ids = tokenizer.encode(expanded_text,
+                                      add_special_tokens=False)
+        return prompt_ids, mm_info, True
+
     def _get_mm_fields_config(
         self,
         hf_inputs: BatchFeature,
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
-        return dict(
+        fields = dict(
             pixel_values=MultiModalFieldConfig.batched("image"),
             image_sizes=MultiModalFieldConfig.batched("image"),
             image_embeds=MultiModalFieldConfig.batched("image"),
             pixel_values_videos=MultiModalFieldConfig.batched("video"),
         )
+        if "codec_proj_mask" in hf_inputs:
+            fields["codec_proj_mask"] = MultiModalFieldConfig.batched("image")
+            fields["codec_kept_counts"] = \
+                MultiModalFieldConfig.batched("image")
+        return fields
 
     def _call_hf_processor(
         self,
@@ -302,17 +476,30 @@ class LlavaOnevisionMultiModalProcessor(
         mm_kwargs: Mapping[str, object],
         tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
+        # Strip codec metadata before the HF processor ever sees it
+        # (mirror of InternVL._call_hf_processor).
+        codec_frame_info = mm_kwargs.get("codec_frame_info")
+        if codec_frame_info is not None:
+            mm_kwargs = {k: v for k, v in mm_kwargs.items()
+                         if k != "codec_frame_info"}
+
         mm_data = dict(mm_data)
         videos = mm_data.pop("videos", [])
         assert isinstance(videos, list)
 
         if not videos:
-            return super()._call_hf_processor(
+            outputs = super()._call_hf_processor(
                 prompt=prompt,
                 mm_data=mm_data,
                 mm_kwargs=mm_kwargs,
                 tok_kwargs=tok_kwargs,
             )
+            # Frames arrive as individual images: attach per-IMAGE codec
+            # masks (one frame per image) to the processor outputs.
+            codec_outputs = self._build_image_codec_outputs(codec_frame_info)
+            if codec_outputs:
+                outputs = BatchFeature({**dict(outputs), **codec_outputs})
+            return outputs
 
         # LLaVA-OneVision processor doesn't support multiple videos
         # with different sizes when converting back to tensors
@@ -359,12 +546,42 @@ class LlavaOnevisionMultiModalProcessor(
 
         video_outputs = {"pixel_values_videos": pixel_values_videos}
 
+        # Codec masks apply to the IMAGE path (frames are sent as images).
+        codec_outputs = self._build_image_codec_outputs(codec_frame_info)
+
         combined_outputs = dict(
             text_outputs,
             **image_outputs,
             **video_outputs,
+            **codec_outputs,
         )
         return BatchFeature(combined_outputs)
+
+    @staticmethod
+    def _build_image_codec_outputs(
+        codec_frame_info: Optional[list],
+    ) -> dict[str, torch.Tensor]:
+        """Build per-IMAGE codec tensors from the request codec_frame_info.
+
+        Each frame is sent as one image, so there is exactly one entry per
+        image: a length-729 proj_mask (27x27 SigLIP grid) and a kept_count.
+        Mirrors InternVL._call_hf_processor's tensor construction.
+        """
+        if codec_frame_info is None:
+            return {}
+        num_images = len(codec_frame_info)
+        num_proj = _LLAVA_NUM_PROJ_TOKENS  # 729
+        proj_mask = torch.zeros(num_images, num_proj, dtype=torch.bool)
+        kept_counts = torch.full((num_images, ), num_proj, dtype=torch.long)
+        for i, f in enumerate(codec_frame_info):
+            if f.get("proj_mask") is not None:
+                proj_mask[i] = torch.tensor(f["proj_mask"], dtype=torch.bool)
+            if f.get("kept_count") is not None:
+                kept_counts[i] = f["kept_count"]
+        return {
+            "codec_proj_mask": proj_mask,
+            "codec_kept_counts": kept_counts,
+        }
 
     def _hf_processor_applies_updates(
         self,
@@ -379,6 +596,15 @@ class LlavaOnevisionMultiModalProcessor(
             hf_processor_mm_kwargs=hf_processor_mm_kwargs,
             tokenization_kwargs=tokenization_kwargs,
         )
+
+        # When codec pruning is active, the HF processor must NOT expand the
+        # placeholders itself (it would emit the full per-image token count);
+        # vLLM's codec-aware _get_prompt_updates handles expansion instead
+        # (mirror of InternVL's enable_hf_prompt_update=False path).
+        prune_enabled = bool(_get_llava_prune_settings()["enabled"])
+        if prune_enabled and hf_processor_mm_kwargs.get(
+                "codec_frame_info") is not None:
+            return False
 
         return base_result and mm_items.get_count("video", strict=False) == 0
 
@@ -396,6 +622,39 @@ class LlavaOnevisionMultiModalProcessor(
 
         hf_config = self.info.get_hf_config()
         video_token_id = hf_config.video_token_index
+
+        # Codec image path: each image emits (kept tokens) + 1 placeholders
+        # (the +1 is the always-kept image_newline). The kept-token count is
+        # derived from proj_mask.sum() -- the SAME quantity the forward uses
+        # via proj_mask.nonzero() -- so the placeholder count and the produced
+        # token count can never drift (mirror of InternVL's repl path).
+        prune_enabled = bool(_get_llava_prune_settings()["enabled"])
+        out_mm_data = out_mm_kwargs.get_data()
+        img_codec_proj_t = (out_mm_data.get("codec_proj_mask")
+                            if prune_enabled else None)
+        if isinstance(img_codec_proj_t, torch.Tensor) and \
+                img_codec_proj_t.numel() > 0:
+            # Per-image kept-token count, clamped to >=1 to match the forward.
+            per_image_kept = [
+                max(1, int(img_codec_proj_t[i].sum().item()))
+                for i in range(img_codec_proj_t.shape[0])
+            ]
+            image_token_id = hf_config.image_token_index
+
+            def get_image_replacement_codec(item_idx: int):
+                if item_idx < len(per_image_kept):
+                    num_image_tokens = per_image_kept[item_idx] + 1
+                else:
+                    num_image_tokens = _LLAVA_NUM_PROJ_TOKENS + 1
+                return [image_token_id] * num_image_tokens
+
+            image_repls = [
+                PromptReplacement(
+                    modality="image",
+                    target=[image_token_id],
+                    replacement=get_image_replacement_codec,
+                )
+            ]
 
         def get_video_replacement(item_idx: int):
             videos = mm_items.get_items(
@@ -501,6 +760,8 @@ class LlavaOnevisionForConditionalGeneration(nn.Module, SupportsMultiModal,
         pixel_values = kwargs.pop("pixel_values", None)
         image_sizes = kwargs.pop("image_sizes", None)
         image_embeds = kwargs.pop("image_embeds", None)
+        codec_proj_mask = kwargs.pop("codec_proj_mask", None)
+        codec_kept_counts = kwargs.pop("codec_kept_counts", None)
 
         if pixel_values is None and image_embeds is None:
             return None
@@ -518,6 +779,8 @@ class LlavaOnevisionForConditionalGeneration(nn.Module, SupportsMultiModal,
                 type="pixel_values",
                 pixel_values=flatten_bn(pixel_values),
                 image_sizes=flatten_bn(image_sizes, concat=True),
+                codec_proj_mask=codec_proj_mask,
+                codec_kept_counts=codec_kept_counts,
                 resolve_bindings={
                     "h": self.config.vision_config.image_size,
                     "w": self.config.vision_config.image_size
@@ -720,6 +983,35 @@ class LlavaOnevisionForConditionalGeneration(nn.Module, SupportsMultiModal,
             torch.split(stacked_image_features, num_patches_per_batch)
         ]
 
+    def _prune_image_with_codec(
+        self,
+        patch_features_batch: torch.Tensor,
+        codec_proj_mask_i: torch.Tensor,
+    ) -> torch.Tensor:
+        """Single-tile codec prune: drop base-tile tokens, keep one newline.
+
+        Args:
+            patch_features_batch: [num_tiles, 729, d] projected patches. For the
+                codec prototype we assume a SINGLE tile (num_tiles == 1).
+            codec_proj_mask_i: [729] bool, True = keep this patch token.
+
+        Returns:
+            [kept + 1, d] = kept base tokens followed by the image_newline.
+            Mirrors InternVL._prune_with_codec's proj_mask index_select.
+        """
+        base_patch_embeds = patch_features_batch[0]  # [729, d]
+        device = base_patch_embeds.device
+        # Flatten to 1-D over the 729 base-tile tokens (the batched MM field can
+        # arrive as [1,729]); nonzero(as_tuple) then yields a clean 1-D index that
+        # index_select requires.
+        keep_idx = codec_proj_mask_i.to(device).reshape(-1).bool().nonzero(
+            as_tuple=True)[0]
+        if keep_idx.numel() == 0:
+            keep_idx = torch.zeros(1, dtype=torch.long, device=device)
+        kept = base_patch_embeds.index_select(0, keep_idx)
+        newline = self.image_newline[None].to(device)
+        return torch.cat((kept, newline), dim=0)
+
     def _process_image_input(
         self,
         image_input: LlavaOnevisionImageInputs,
@@ -728,6 +1020,16 @@ class LlavaOnevisionForConditionalGeneration(nn.Module, SupportsMultiModal,
             return [image_input["data"]]
 
         patch_embeddings = self._process_image_pixels(image_input)
+
+        settings = _get_llava_prune_settings()
+        codec_proj_mask = image_input.get("codec_proj_mask")
+        if settings["enabled"] and codec_proj_mask is not None:
+            # Single-tile codec prune (prototype): one frame per image.
+            return [
+                self._prune_image_with_codec(
+                    patch_features_batch, codec_proj_mask[i])
+                for i, patch_features_batch in enumerate(patch_embeddings)
+            ]
 
         image_sizes = image_input.get("image_sizes")
         if image_sizes is None:
