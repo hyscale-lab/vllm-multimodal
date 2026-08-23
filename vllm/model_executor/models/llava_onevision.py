@@ -14,20 +14,25 @@ from transformers.models.llava_onevision.modeling_llava_onevision import (
     get_anyres_image_grid_shape, unpad_image)
 
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.codec_cache import (
+    apply_hf_processor_with_codec_cache,
+    hash_mm_items_with_codec,
+    normalize_codec_frame_info,
+)
 from vllm.multimodal.inputs import (MultiModalDataDict, MultiModalFieldConfig,
                                     MultiModalKwargsItems)
-from vllm.multimodal.hasher import MultiModalHasher
 from vllm.multimodal.parse import (ImageSize, MultiModalDataItems,
                                    VideoEmbeddingItems, VideoProcessorItems)
-from vllm.multimodal.processing import (MultiModalProcessingInfo,
-                                        PromptReplacement, PromptUpdate)
+from vllm.multimodal.processing import PromptReplacement, PromptUpdate
 from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from .clip import CLIPVisionModel
-from .interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsPP
+from .interfaces import (MultiModalEmbeddings, SupportsCodecGuidedPruning,
+                         SupportsMultiModal, SupportsPP)
 from .llava import LlavaDummyInputsBuilder, init_vision_tower_for_llava
 from .llava_next import (BaseLlavaNextMultiModalProcessor, LlavaNextLikeConfig,
                          LlavaNextProcessingInfo)
@@ -39,11 +44,60 @@ from .utils import (AutoWeightsLoader, WeightsMapper, flatten_bn,
 # For profile run
 _MAX_FRAMES_PER_VIDEO = 16
 
-# Number of codec-selectable visual tokens per SINGLE-TILE image: 27x27 = 729
-# SigLIP patches (no image-path pooling). The trailing image_newline token is
-# always kept and is NOT part of the selectable proj grid, so the model emits
-# kept_count + 1 tokens per single-tile image.
-_LLAVA_NUM_PROJ_TOKENS = 729
+# LLaVA-OV's SigLIP tower emits a 27x27 patch grid.  The native video path
+# applies stride-2 spatial pooling, producing ceil(27 / 2)^2 = 14x14 tokens.
+# VLLM_LLAVA_IMAGE_POOL makes the image path use the same geometry.  The
+# trailing image_newline is never part of the selectable codec grid.
+_LLAVA_NATIVE_GRID = 27
+_LLAVA_POOLED_GRID = 14
+_LLAVA_NATIVE_PROJ_TOKENS = _LLAVA_NATIVE_GRID**2
+_LLAVA_POOLED_PROJ_TOKENS = _LLAVA_POOLED_GRID**2
+
+logger = init_logger(__name__)
+
+
+def _expand_bilinear_output_mask(
+    output_keep_mask: torch.Tensor,
+    input_shape: tuple[int, int],
+    output_shape: tuple[int, int],
+) -> torch.Tensor:
+    """Return every input cell used by a kept bilinear output cell."""
+    in_h, in_w = input_shape
+    out_h, out_w = output_shape
+    if output_keep_mask.numel() != out_h * out_w:
+        raise ValueError(
+            "Bilinear output mask shape mismatch: "
+            f"mask={output_keep_mask.numel()}, grid={output_shape}")
+    if input_shape == output_shape:
+        return output_keep_mask.reshape(-1).bool().clone()
+
+    device = output_keep_mask.device
+    out_keep = output_keep_mask.reshape(out_h, out_w).bool()
+    kept = out_keep.nonzero(as_tuple=False)
+    source_keep = torch.zeros(in_h, in_w, dtype=torch.bool, device=device)
+    if kept.numel() == 0:
+        return source_keep.reshape(-1)
+
+    def axis_support(input_size: int, output_size: int):
+        coord = ((torch.arange(output_size, device=device,
+                               dtype=torch.float32) + 0.5)
+                 * input_size / output_size - 0.5)
+        lower_raw = torch.floor(coord)
+        upper_raw = lower_raw + 1
+        upper_weight = coord - lower_raw
+        lower_weight = 1 - upper_weight
+        lower = lower_raw.clamp(0, input_size - 1).long()
+        upper = upper_raw.clamp(0, input_size - 1).long()
+        return lower, upper, lower_weight, upper_weight
+
+    y0, y1, wy0, wy1 = axis_support(in_h, out_h)
+    x0, x1, wx0, wx1 = axis_support(in_w, out_w)
+    oy, ox = kept.unbind(dim=1)
+    for sy, wy in ((y0, wy0), (y1, wy1)):
+        for sx, wx in ((x0, wx0), (x1, wx1)):
+            active = (wy[oy] * wx[ox]) > 0
+            source_keep[sy[oy[active]], sx[ox[active]]] = True
+    return source_keep.reshape(-1)
 
 
 def _get_llava_prune_settings() -> dict[str, object]:
@@ -53,9 +107,11 @@ def _get_llava_prune_settings() -> dict[str, object]:
     present in the request (see ``has_codec`` checks below).
     """
     enabled = os.environ.get("VLLM_LLAVA_PRUNE", "0") == "1"
+    image_pool = os.environ.get("VLLM_LLAVA_IMAGE_POOL", "0") == "1"
     debug = os.environ.get("VLLM_LLAVA_PRUNE_DEBUG", "0") == "1"
     return {
         "enabled": enabled,
+        "image_pool": image_pool,
         "debug": debug,
     }
 
@@ -104,8 +160,9 @@ class LlavaOnevisionImagePixelInputs(TensorSchema):
 
     # Codec-guided pruning metadata (optional; present only when the request
     # carries codec_frame_info and VLLM_LLAVA_PRUNE is enabled). One row per
-    # image: proj_mask over the 27x27 SigLIP grid + kept_count.
-    codec_proj_mask: Optional[torch.Tensor] = None  # [num_images, 729]
+    # image: token keep mask over the active image grid. The active grid
+    # is 14x14 with VLLM_LLAVA_IMAGE_POOL=1, otherwise the native 27x27 grid.
+    codec_token_keep_mask: Optional[torch.Tensor] = None
     codec_kept_counts: Optional[torch.Tensor] = None  # [num_images]
 
 
@@ -314,34 +371,19 @@ class LlavaOnevisionMultiModalProcessor(
 
     def _hash_mm_items(self, mm_items, hf_processor_mm_kwargs,
                        tokenization_kwargs, **kwargs):
-        # Fold per-frame kept_count into the per-item cache key so that the
-        # same pixels with different codec masks do not collide in the MM
-        # cache (mirror of InternVL._hash_mm_items).
         codec_info = hf_processor_mm_kwargs.get("codec_frame_info")
         clean_kwargs = {k: v for k, v in hf_processor_mm_kwargs.items()
                         if k != "codec_frame_info"}
         if codec_info is None:
             return super()._hash_mm_items(
                 mm_items, clean_kwargs, tokenization_kwargs, **kwargs)
-
-        kept_counts = [f.get("kept_count") for f in codec_info]
-        model_id = self.info.model_id
-        hashes: dict[str, list[str]] = {}
-        for modality, items in mm_items.items():
-            modality_hashes: list[str] = []
-            for i, item in enumerate(items):
-                per_item_kw = dict(clean_kwargs)
-                if modality == "image" and i < len(kept_counts):
-                    # One codec entry per image (one frame per image).
-                    per_item_kw["_codec_kept"] = kept_counts[i]
-                modality_hashes.append(
-                    MultiModalHasher.hash_kwargs(
-                        model_id=model_id,
-                        **{modality: item},
-                        **per_item_kw,
-                        **tokenization_kwargs))
-            hashes[modality] = modality_hashes
-        return hashes
+        return hash_mm_items_with_codec(
+            self,
+            mm_items,
+            hf_processor_mm_kwargs,
+            tokenization_kwargs,
+            **kwargs,
+        )
 
     def _cached_apply_hf_processor(self, prompt, mm_data_items,
                                    hf_processor_mm_kwargs,
@@ -357,100 +399,14 @@ class LlavaOnevisionMultiModalProcessor(
                 tokenization_kwargs=tokenization_kwargs,
                 **kwargs)
 
-        mm_hashes = self._hash_mm_items(
-            mm_data_items, hf_processor_mm_kwargs,
-            tokenization_kwargs, **kwargs)
-
-        mm_is_cached = {
-            modality: cache.is_cached(hashes)
-            for modality, hashes in mm_hashes.items()
-        }
-        mm_missing_idxs: dict[str, list[int]] = {
-            modality: [
-                idx for idx, is_cached
-                in enumerate(items_is_cached) if not is_cached
-            ]
-            for modality, items_is_cached in mm_is_cached.items()
-        }
-        mm_missing_data: dict[str, list] = {}
-        for modality, idxs in mm_missing_idxs.items():
-            mm_missing_data[modality] = [
-                mm_data_items[modality][idx] for idx in idxs]
-        mm_missing_data_items = self._to_mm_items(mm_missing_data)
-
-        # Codec masks are per-image; re-filter to the cache-missing images so
-        # they stay positionally aligned (mirror of InternVL).
-        filtered_kwargs = dict(hf_processor_mm_kwargs)
-        image_missing_idxs = mm_missing_idxs.get("image", [])
-        filtered_codec = ([codec_frame_info[i] for i in image_missing_idxs]
-                          if image_missing_idxs else None)
-        if filtered_codec:
-            filtered_kwargs["codec_frame_info"] = filtered_codec
-        else:
-            filtered_kwargs.pop("codec_frame_info", None)
-
-        (
-            prompt_ids,
-            mm_missing_processed_data,
-            is_update_applied,
-        ) = self._apply_hf_processor_main(
+        return apply_hf_processor_with_codec_cache(
+            self,
             prompt=prompt,
-            mm_items=mm_missing_data_items,
-            hf_processor_mm_kwargs=filtered_kwargs,
+            mm_data_items=mm_data_items,
+            hf_processor_mm_kwargs=hf_processor_mm_kwargs,
             tokenization_kwargs=tokenization_kwargs,
-            enable_hf_prompt_update=False,
+            **kwargs,
         )
-
-        mm_missing_kwargs = MultiModalKwargsItems.from_hf_inputs(
-            mm_missing_processed_data,
-            self._get_mm_fields_config(mm_missing_processed_data,
-                                       hf_processor_mm_kwargs),
-        )
-        mm_missing_prompt_updates = self._get_mm_prompt_updates(
-            mm_missing_data_items,
-            hf_processor_mm_kwargs,
-            mm_missing_kwargs,
-        )
-
-        mm_kwargs, mm_prompt_updates = self._merge_mm_kwargs(
-            cache,
-            mm_hashes=mm_hashes,
-            mm_missing_kwargs=mm_missing_kwargs,
-            mm_missing_prompt_updates=mm_missing_prompt_updates,
-        )
-
-        mm_info = MultiModalProcessingInfo(
-            kwargs=mm_kwargs,
-            hashes=mm_hashes,
-            prompt_updates=mm_prompt_updates,
-        )
-
-        if is_update_applied:
-            return prompt_ids, mm_info, is_update_applied
-
-        tokenizer = self.info.get_tokenizer()
-        expanded_text = (prompt if isinstance(prompt, str)
-                         else tokenizer.decode(prompt_ids))
-
-        for modality in ("image", "video"):
-            if modality not in mm_prompt_updates:
-                continue
-            for item_updates in mm_prompt_updates[modality]:
-                if not item_updates:
-                    continue
-                update = item_updates[0]
-                target = update.target
-                repl = update.content.full
-                if (not isinstance(target, str)
-                        or not isinstance(repl, str)):
-                    return prompt_ids, mm_info, is_update_applied
-                if target not in expanded_text:
-                    return prompt_ids, mm_info, is_update_applied
-                expanded_text = expanded_text.replace(target, repl, 1)
-
-        prompt_ids = tokenizer.encode(expanded_text,
-                                      add_special_tokens=False)
-        return prompt_ids, mm_info, True
 
     def _get_mm_fields_config(
         self,
@@ -463,8 +419,9 @@ class LlavaOnevisionMultiModalProcessor(
             image_embeds=MultiModalFieldConfig.batched("image"),
             pixel_values_videos=MultiModalFieldConfig.batched("video"),
         )
-        if "codec_proj_mask" in hf_inputs:
-            fields["codec_proj_mask"] = MultiModalFieldConfig.batched("image")
+        if "codec_token_keep_mask" in hf_inputs:
+            fields["codec_token_keep_mask"] = \
+                MultiModalFieldConfig.batched("image")
             fields["codec_kept_counts"] = \
                 MultiModalFieldConfig.batched("image")
         return fields
@@ -487,7 +444,12 @@ class LlavaOnevisionMultiModalProcessor(
         videos = mm_data.pop("videos", [])
         assert isinstance(videos, list)
 
-        if not videos:
+        # With image-path pooling, do not let the HF processor expand <image>
+        # using its native any-resolution token count. Process text and images
+        # separately, then let vLLM apply the exact 197/kept+1 replacement from
+        # _get_prompt_updates. Otherwise text and vision embeddings can drift.
+        image_pool = bool(_get_llava_prune_settings()["image_pool"])
+        if not videos and not image_pool:
             outputs = super()._call_hf_processor(
                 prompt=prompt,
                 mm_data=mm_data,
@@ -564,22 +526,33 @@ class LlavaOnevisionMultiModalProcessor(
         """Build per-IMAGE codec tensors from the request codec_frame_info.
 
         Each frame is sent as one image, so there is exactly one entry per
-        image: a length-729 proj_mask (27x27 SigLIP grid) and a kept_count.
-        Mirrors InternVL._call_hf_processor's tensor construction.
+        image. The mask is 14x14 when image pooling is enabled, otherwise it is
+        the native 27x27 grid.
         """
         if codec_frame_info is None:
             return {}
+        codec_frame_info = normalize_codec_frame_info(
+            codec_frame_info, require_complete=True)
         num_images = len(codec_frame_info)
-        num_proj = _LLAVA_NUM_PROJ_TOKENS  # 729
-        proj_mask = torch.zeros(num_images, num_proj, dtype=torch.bool)
-        kept_counts = torch.full((num_images, ), num_proj, dtype=torch.long)
+        settings = _get_llava_prune_settings()
+        num_proj = (_LLAVA_POOLED_PROJ_TOKENS
+                    if settings["image_pool"] else
+                    _LLAVA_NATIVE_PROJ_TOKENS)
+        token_keep_mask = torch.empty(num_images, num_proj, dtype=torch.bool)
+        kept_counts = torch.empty(num_images, dtype=torch.long)
+        expected_shape = ((_LLAVA_POOLED_GRID, _LLAVA_POOLED_GRID)
+                          if settings["image_pool"] else
+                          (_LLAVA_NATIVE_GRID, _LLAVA_NATIVE_GRID))
         for i, f in enumerate(codec_frame_info):
-            if f.get("proj_mask") is not None:
-                proj_mask[i] = torch.tensor(f["proj_mask"], dtype=torch.bool)
-            if f.get("kept_count") is not None:
-                kept_counts[i] = f["kept_count"]
+            if tuple(f["token_shape"]) != expected_shape:
+                raise ValueError(
+                    "LLaVA codec token grid mismatch: client sent "
+                    f"{tuple(f['token_shape'])}, expected {expected_shape}")
+            token_keep_mask[i] = torch.tensor(
+                f["token_keep_mask"], dtype=torch.bool)
+            kept_counts[i] = f["kept_count"]
         return {
-            "codec_proj_mask": proj_mask,
+            "codec_token_keep_mask": token_keep_mask,
             "codec_kept_counts": kept_counts,
         }
 
@@ -601,7 +574,11 @@ class LlavaOnevisionMultiModalProcessor(
         # placeholders itself (it would emit the full per-image token count);
         # vLLM's codec-aware _get_prompt_updates handles expansion instead
         # (mirror of InternVL's enable_hf_prompt_update=False path).
-        prune_enabled = bool(_get_llava_prune_settings()["enabled"])
+        settings = _get_llava_prune_settings()
+        prune_enabled = bool(settings["enabled"])
+        image_pool = bool(settings["image_pool"])
+        if image_pool and mm_items.get_count("image", strict=False) > 0:
+            return False
         if prune_enabled and hf_processor_mm_kwargs.get(
                 "codec_frame_info") is not None:
             return False
@@ -625,27 +602,31 @@ class LlavaOnevisionMultiModalProcessor(
 
         # Codec image path: each image emits (kept tokens) + 1 placeholders
         # (the +1 is the always-kept image_newline). The kept-token count is
-        # derived from proj_mask.sum() -- the SAME quantity the forward uses
-        # via proj_mask.nonzero() -- so the placeholder count and the produced
+        # derived from token_keep_mask.sum(), the same quantity the forward uses,
+        # so the placeholder count and the produced
         # token count can never drift (mirror of InternVL's repl path).
-        prune_enabled = bool(_get_llava_prune_settings()["enabled"])
+        settings = _get_llava_prune_settings()
+        prune_enabled = bool(settings["enabled"])
+        image_pool = bool(settings["image_pool"])
         out_mm_data = out_mm_kwargs.get_data()
-        img_codec_proj_t = (out_mm_data.get("codec_proj_mask")
+        img_codec_keep_t = (out_mm_data.get("codec_token_keep_mask")
                             if prune_enabled else None)
-        if isinstance(img_codec_proj_t, torch.Tensor) and \
-                img_codec_proj_t.numel() > 0:
+        if image_pool or (isinstance(img_codec_keep_t, torch.Tensor) and
+                          img_codec_keep_t.numel() > 0):
             # Per-image kept-token count, clamped to >=1 to match the forward.
-            per_image_kept = [
-                max(1, int(img_codec_proj_t[i].sum().item()))
-                for i in range(img_codec_proj_t.shape[0])
-            ]
+            per_image_kept = (
+                [int(img_codec_keep_t[i].sum().item())
+                 for i in range(img_codec_keep_t.shape[0])]
+                if isinstance(img_codec_keep_t, torch.Tensor) else [])
             image_token_id = hf_config.image_token_index
 
             def get_image_replacement_codec(item_idx: int):
                 if item_idx < len(per_image_kept):
                     num_image_tokens = per_image_kept[item_idx] + 1
                 else:
-                    num_image_tokens = _LLAVA_NUM_PROJ_TOKENS + 1
+                    num_proj = (_LLAVA_POOLED_PROJ_TOKENS if image_pool else
+                                _LLAVA_NATIVE_PROJ_TOKENS)
+                    num_image_tokens = num_proj + 1
                 return [image_token_id] * num_image_tokens
 
             image_repls = [
@@ -707,6 +688,7 @@ class LlavaOnevisionMultiModalProjector(nn.Module):
     info=LlavaOnevisionProcessingInfo,
     dummy_inputs=LlavaOnevisionDummyInputsBuilder)
 class LlavaOnevisionForConditionalGeneration(nn.Module, SupportsMultiModal,
+                                             SupportsCodecGuidedPruning,
                                              SupportsPP):
 
     hf_to_vllm_mapper = WeightsMapper(
@@ -760,7 +742,7 @@ class LlavaOnevisionForConditionalGeneration(nn.Module, SupportsMultiModal,
         pixel_values = kwargs.pop("pixel_values", None)
         image_sizes = kwargs.pop("image_sizes", None)
         image_embeds = kwargs.pop("image_embeds", None)
-        codec_proj_mask = kwargs.pop("codec_proj_mask", None)
+        codec_token_keep_mask = kwargs.pop("codec_token_keep_mask", None)
         codec_kept_counts = kwargs.pop("codec_kept_counts", None)
 
         if pixel_values is None and image_embeds is None:
@@ -779,7 +761,7 @@ class LlavaOnevisionForConditionalGeneration(nn.Module, SupportsMultiModal,
                 type="pixel_values",
                 pixel_values=flatten_bn(pixel_values),
                 image_sizes=flatten_bn(image_sizes, concat=True),
-                codec_proj_mask=codec_proj_mask,
+                codec_token_keep_mask=codec_token_keep_mask,
                 codec_kept_counts=codec_kept_counts,
                 resolve_bindings={
                     "h": self.config.vision_config.image_size,
@@ -983,34 +965,105 @@ class LlavaOnevisionForConditionalGeneration(nn.Module, SupportsMultiModal,
             torch.split(stacked_image_features, num_patches_per_batch)
         ]
 
-    def _prune_image_with_codec(
-        self,
-        patch_features_batch: torch.Tensor,
-        codec_proj_mask_i: torch.Tensor,
+    @staticmethod
+    def _sparse_siglip_embeddings(
+        pixel_values: torch.Tensor,
+        encode_mask: torch.Tensor,
+        vision_tower: SiglipVisionModel,
     ) -> torch.Tensor:
-        """Single-tile codec prune: drop base-tile tokens, keep one newline.
+        embeddings = vision_tower.vision_model.embeddings
+        patch_size = embeddings.patch_size
+        target_dtype = embeddings.patch_embedding.weight.dtype
+        pixels = pixel_values.to(dtype=target_dtype).unsqueeze(0)
+        patches = nn.functional.unfold(
+            pixels, kernel_size=patch_size, stride=patch_size)
+        patches = patches.squeeze(0).transpose(0, 1)
 
-        Args:
-            patch_features_batch: [num_tiles, 729, d] projected patches. For the
-                codec prototype we assume a SINGLE tile (num_tiles == 1).
-            codec_proj_mask_i: [729] bool, True = keep this patch token.
+        selected = patches[encode_mask]
+        conv_weight = embeddings.patch_embedding.weight.reshape(
+            embeddings.embed_dim, -1)
+        patch_embeds = nn.functional.linear(
+            selected, conv_weight, embeddings.patch_embedding.bias)
+        position_ids = encode_mask.nonzero(as_tuple=False).squeeze(-1)
+        position_embeds = embeddings.position_embedding(position_ids)
+        return patch_embeds + position_embeds.to(target_dtype)
 
-        Returns:
-            [kept + 1, d] = kept base tokens followed by the image_newline.
-            Mirrors InternVL._prune_with_codec's proj_mask index_select.
-        """
-        base_patch_embeds = patch_features_batch[0]  # [729, d]
-        device = base_patch_embeds.device
-        # Flatten to 1-D over the 729 base-tile tokens (the batched MM field can
-        # arrive as [1,729]); nonzero(as_tuple) then yields a clean 1-D index that
-        # index_select requires.
-        keep_idx = codec_proj_mask_i.to(device).reshape(-1).bool().nonzero(
-            as_tuple=True)[0]
-        if keep_idx.numel() == 0:
-            keep_idx = torch.zeros(1, dtype=torch.long, device=device)
-        kept = base_patch_embeds.index_select(0, keep_idx)
-        newline = self.image_newline[None].to(device)
-        return torch.cat((kept, newline), dim=0)
+    def _process_image_pixels_with_codec(
+        self,
+        inputs: LlavaOnevisionImagePixelInputs,
+        token_keep_mask: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        if not isinstance(self.vision_tower, SiglipVisionModel):
+            raise ValueError("LLaVA codec sparse path requires SigLIP")
+        if self.config.vision_feature_select_strategy != "full":
+            raise ValueError("LLaVA codec sparse path requires full features")
+
+        pixel_values = inputs["pixel_values"]
+        if isinstance(pixel_values, torch.Tensor):
+            base_pixels = pixel_values[:, 0]
+        else:
+            base_pixels = torch.stack([views[0] for views in pixel_values])
+
+        settings = _get_llava_prune_settings()
+        output_grid = (_LLAVA_POOLED_GRID
+                       if settings["image_pool"] else _LLAVA_NATIVE_GRID)
+        input_shape = (_LLAVA_NATIVE_GRID, _LLAVA_NATIVE_GRID)
+        output_shape = (output_grid, output_grid)
+        masks = token_keep_mask.reshape(base_pixels.shape[0], -1).to(
+            base_pixels.device).bool()
+
+        encode_masks = [
+            _expand_bilinear_output_mask(mask, input_shape, output_shape)
+            for mask in masks
+        ]
+        sparse_inputs = [
+            self._sparse_siglip_embeddings(base_pixels[i], encode_masks[i],
+                                           self.vision_tower)
+            for i in range(base_pixels.shape[0])
+        ]
+        sequence_lengths = [x.shape[0] for x in sparse_inputs]
+        if any(length == 0 for length in sequence_lengths):
+            raise ValueError("LLaVA codec mask must keep at least one token")
+
+        packed = torch.cat(sparse_inputs, dim=0).unsqueeze(0)
+        cu_seqlens = torch.zeros(
+            len(sequence_lengths) + 1,
+            dtype=torch.int32,
+            device=packed.device,
+        )
+        torch.cumsum(
+            torch.tensor(sequence_lengths,
+                         dtype=torch.int32,
+                         device=packed.device),
+            dim=0,
+            out=cu_seqlens[1:],
+        )
+        encoded = self.vision_tower.forward_packed(
+            packed, cu_seqlens, max(sequence_lengths))
+        encoded_flat = encoded.squeeze(0)
+        projected_flat = self.multi_modal_projector(encoded_flat)
+
+        results: list[torch.Tensor] = []
+        offset = 0
+        output_dim = projected_flat.shape[-1]
+        debug = bool(settings["debug"])
+        for i, length in enumerate(sequence_lengths):
+            projected = projected_flat[offset:offset + length]
+            offset += length
+            full = projected.new_zeros(_LLAVA_NATIVE_PROJ_TOKENS, output_dim)
+            full[encode_masks[i]] = projected
+            if settings["image_pool"]:
+                full = self.apply_pooling(full.unsqueeze(0))[0]
+            keep_idx = masks[i].nonzero(as_tuple=False).squeeze(-1)
+            kept = full.index_select(0, keep_idx)
+            newline = self.image_newline[None].to(kept.device)
+            results.append(torch.cat((kept, newline), dim=0))
+            if debug:
+                logger.info(
+                    "LLaVA codec sparse: image=%s kept=%s/%s "
+                    "vit_tokens=%s/%s.", i, keep_idx.numel(),
+                    masks.shape[1], length, _LLAVA_NATIVE_PROJ_TOKENS)
+        return results
 
     def _process_image_input(
         self,
@@ -1019,16 +1072,24 @@ class LlavaOnevisionForConditionalGeneration(nn.Module, SupportsMultiModal,
         if image_input["type"] == "image_embeds":
             return [image_input["data"]]
 
+        settings = _get_llava_prune_settings()
+        token_keep_mask = image_input.get("codec_token_keep_mask")
+        if settings["enabled"] and token_keep_mask is not None:
+            return self._process_image_pixels_with_codec(
+                image_input, token_keep_mask)
+
         patch_embeddings = self._process_image_pixels(image_input)
 
-        settings = _get_llava_prune_settings()
-        codec_proj_mask = image_input.get("codec_proj_mask")
-        if settings["enabled"] and codec_proj_mask is not None:
-            # Single-tile codec prune (prototype): one frame per image.
+        if settings["image_pool"]:
+            # Deliberately retain only the base view. This makes an image frame
+            # identical in token geometry to a frame on the native video path:
+            # 14x14 pooled visual tokens plus one image newline.
             return [
-                self._prune_image_with_codec(
-                    patch_features_batch, codec_proj_mask[i])
-                for i, patch_features_batch in enumerate(patch_embeddings)
+                torch.cat((self.apply_pooling(
+                    patch_features_batch[0].unsqueeze(0))[0],
+                           self.image_newline[None].to(
+                               patch_features_batch.device)), dim=0)
+                for patch_features_batch in patch_embeddings
             ]
 
         image_sizes = image_input.get("image_sizes")
@@ -1119,7 +1180,8 @@ class LlavaOnevisionForConditionalGeneration(nn.Module, SupportsMultiModal,
         scaled_shape = [math.ceil(height / stride), math.ceil(width / stride)]
         image_feature = nn.functional.interpolate(image_features,
                                                   size=scaled_shape,
-                                                  mode='bilinear')
+                                                  mode='bilinear',
+                                                  align_corners=False)
         image_feature = image_feature.permute(0, 2, 3, 1)
         image_feature = image_feature.view(batch_frames, -1, dim)
         return image_feature

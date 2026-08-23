@@ -151,6 +151,13 @@ class SupportsMultiModalPruning(Protocol):
         ...
 
 
+@runtime_checkable
+class SupportsCodecGuidedPruning(Protocol):
+    """Marker interface for models accepting codec-guided keep masks."""
+
+    supports_codec_guided_pruning: ClassVar[Literal[True]] = True
+
+
 @overload
 def supports_multimodal(
         model: type[object]) -> TypeIs[type[SupportsMultiModal]]:
@@ -195,6 +202,25 @@ def supports_multimodal_pruning(
 ) -> Union[TypeIs[type[SupportsMultiModalPruning]],
            TypeIs[SupportsMultiModalPruning]]:
     return getattr(model, "supports_multimodal_pruning", False)
+
+
+@overload
+def supports_codec_guided_pruning(
+        model: type[object]) -> TypeIs[type[SupportsCodecGuidedPruning]]:
+    ...
+
+
+@overload
+def supports_codec_guided_pruning(
+        model: object) -> TypeIs[SupportsCodecGuidedPruning]:
+    ...
+
+
+def supports_codec_guided_pruning(
+    model: Union[type[object], object],
+) -> Union[TypeIs[type[SupportsCodecGuidedPruning]],
+           TypeIs[SupportsCodecGuidedPruning]]:
+    return getattr(model, "supports_codec_guided_pruning", False)
 
 
 @runtime_checkable

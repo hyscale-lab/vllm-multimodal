@@ -5,14 +5,46 @@ import itertools
 from functools import partial
 
 import pytest
+import torch
+import torch.nn.functional as F
 from PIL import Image
 from pqdm.threads import pqdm
 
+from vllm.model_executor.models.llava_onevision import (
+    _expand_bilinear_output_mask,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.parse import ImageSize
 from vllm.multimodal.processing import BaseMultiModalProcessor
 
 from ...utils import build_model_context
+
+
+def test_bilinear_output_mask_keeps_complete_pooling_inputs():
+    output_keep = torch.zeros(14, 14, dtype=torch.bool)
+    output_keep[0, 0] = True
+    output_keep[6, 7] = True
+    output_keep[13, 13] = True
+
+    source_keep = _expand_bilinear_output_mask(
+        output_keep, (27, 27), (14, 14)).view(27, 27)
+    dense = torch.randn(1, 3, 27, 27)
+    sparse = dense * source_keep
+    dense_pooled = F.interpolate(
+        dense, size=(14, 14), mode="bilinear", align_corners=False)
+    sparse_pooled = F.interpolate(
+        sparse, size=(14, 14), mode="bilinear", align_corners=False)
+
+    assert torch.equal(dense_pooled[:, :, output_keep],
+                       sparse_pooled[:, :, output_keep])
+
+
+def test_bilinear_full_output_mask_keeps_full_source_grid():
+    output_keep = torch.ones(14, 14, dtype=torch.bool)
+    source_keep = _expand_bilinear_output_mask(
+        output_keep, (27, 27), (14, 14))
+    assert source_keep.shape == (27 * 27, )
+    assert source_keep.all()
 
 
 def _validate_image_max_tokens_one(

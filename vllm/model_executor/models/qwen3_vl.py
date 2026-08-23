@@ -23,7 +23,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Qwen3VL model compatible with HuggingFace weights."""
-import hashlib
 import os
 from collections.abc import Iterable, Mapping, Sequence
 from functools import partial
@@ -59,14 +58,18 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.codec_cache import (
+    apply_cached_prompt_updates,
+    apply_hf_processor_with_codec_cache,
+    hash_mm_items_with_codec,
+    normalize_codec_frame_info,
+)
 from vllm.multimodal.inputs import (MultiModalDataDict, MultiModalFieldConfig,
                                     MultiModalKwargsItem,
                                     MultiModalKwargsItems, VideoItem)
 from vllm.multimodal.parse import (ImageSize, MultiModalDataItems,
                                    MultiModalDataParser)
-from vllm.multimodal.hasher import MultiModalHasher
 from vllm.multimodal.processing import (BaseMultiModalProcessor,
-                                        MultiModalProcessingInfo,
                                         PromptReplacement, PromptUpdate,
                                         PromptUpdateDetails)
 from vllm.multimodal.profiling import BaseDummyInputsBuilder
@@ -75,9 +78,9 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import uses_mrope
 from vllm.utils import is_list_of
 
-from .interfaces import (MultiModalEmbeddings, SupportsLoRA,
-                         SupportsMultiModal, SupportsMultiModalPruning,
-                         SupportsPP)
+from .interfaces import (MultiModalEmbeddings, SupportsCodecGuidedPruning,
+                         SupportsLoRA, SupportsMultiModal,
+                         SupportsMultiModalPruning, SupportsPP)
 from vllm.multimodal.evs import (compute_mrope_for_media,
                                  recompute_mrope_positions)
 from .qwen2_5_vl import (Qwen2_5_VisionAttention,
@@ -341,6 +344,24 @@ class Qwen3_VisionTransformer(nn.Module):
                 torch.get_default_dtype()):
             self.attn_backend = _Backend.FLASH_ATTN
             use_upstream_fa = True
+
+        # Qwen3-VL's ViT has head_dim = hidden_size // num_heads = 1152 // 16 = 72,
+        # and vLLM's bundled FA2 kernel rejects any head_dim that is not a multiple
+        # of 32. The upstream `flash_attn` package handles 72, which is what
+        # use_upstream_fa selects -- but when that package is absent (or when
+        # VLLM_ATTENTION_BACKEND=FLASH_ATTN is set, which makes
+        # get_vit_attn_backend return FLASH_ATTN and skips the branch above),
+        # we would dispatch to the bundled kernel and abort engine startup with
+        # "This flash attention build does not support headdim not being a
+        # multiple of 32". Fall back to XFORMERS for the ViT only, so the LLM
+        # attention backend stays whatever the caller asked for.
+        if (self.attn_backend == _Backend.FLASH_ATTN and not use_upstream_fa
+                and head_dim % 32 != 0):
+            logger.warning(
+                "Qwen3-VL ViT head_dim=%d is not supported by the bundled "
+                "FlashAttention kernel and upstream flash_attn is unavailable; "
+                "using XFORMERS for the vision tower.", head_dim)
+            self.attn_backend = _Backend.XFORMERS
 
         if self.attn_backend not in {
                 _Backend.FLASH_ATTN, _Backend.TORCH_SDPA, _Backend.XFORMERS,
@@ -867,39 +888,13 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo]
         if codec_info is None or not _QWEN3VL_PRUNE_ENABLED:
             return super()._hash_mm_items(
                 mm_items, clean_kwargs, tokenization_kwargs, **kwargs)
-
-        model_id = self.info.model_id
-        hashes: dict[str, list[str]] = {}
-        for modality, items in mm_items.items():
-            modality_hashes: list[str] = []
-            for i, item in enumerate(items):
-                per_item_kw = dict(clean_kwargs)
-                if modality == "image" and i < len(codec_info):
-                    frame = codec_info[i]
-                    per_item_kw["_codec_kept_count"] = frame.get("kept_count")
-
-                    proj_mask = frame.get("proj_mask")
-                    if proj_mask is not None:
-                        proj_bytes = np.asarray(proj_mask, dtype=np.uint8)
-                        per_item_kw["_codec_proj_mask_md5"] = hashlib.md5(
-                            proj_bytes.tobytes()).hexdigest()
-
-                    prune_mask = frame.get("mask")
-                    if prune_mask is not None:
-                        prune_bytes = np.asarray(prune_mask, dtype=np.uint8)
-                        per_item_kw["_codec_prune_mask_md5"] = hashlib.md5(
-                            prune_bytes.tobytes()).hexdigest()
-
-                modality_hashes.append(
-                    MultiModalHasher.hash_kwargs(
-                        model_id=model_id,
-                        **{modality: item},
-                        **per_item_kw,
-                        **tokenization_kwargs,
-                    ))
-            hashes[modality] = modality_hashes
-
-        return hashes
+        return hash_mm_items_with_codec(
+            self,
+            mm_items,
+            hf_processor_mm_kwargs,
+            tokenization_kwargs,
+            **kwargs,
+        )
 
     def _cached_apply_hf_processor(
         self,
@@ -911,60 +906,35 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo]
         mm_uuids=None,
     ):
         codec_info = hf_processor_mm_kwargs.get("codec_frame_info")
-        if (codec_info is not None and _QWEN3VL_PRUNE_ENABLED
-                and self.cache is not None):
-            mm_hashes = self._hash_mm_items(
-                mm_data_items, hf_processor_mm_kwargs,
-                tokenization_kwargs, mm_uuids=mm_uuids)
-            image_hashes = mm_hashes.get("image", [])
-            if image_hashes:
-                is_cached = self.cache.is_cached(image_hashes)
-                missing_idxs = [i for i, c in enumerate(is_cached) if not c]
-                if missing_idxs and len(missing_idxs) < len(image_hashes):
-                    self._codec_missing_indices = missing_idxs
-                else:
-                    self._codec_missing_indices = None
-            else:
-                self._codec_missing_indices = None
+        cache = self.cache
+        _, passthrough_data = self._get_hf_mm_data(mm_data_items)
+
+        if (codec_info is None or not _QWEN3VL_PRUNE_ENABLED
+                or cache is None or passthrough_data):
+            (prompt_ids, mm_info,
+             is_update_applied) = super()._cached_apply_hf_processor(
+                 prompt=prompt,
+                 mm_data_items=mm_data_items,
+                 hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+                 tokenization_kwargs=tokenization_kwargs,
+                 mm_uuids=mm_uuids,
+             )
         else:
-            self._codec_missing_indices = None
-
-        (prompt_ids, mm_info,
-         is_update_applied) = super()._cached_apply_hf_processor(
-             prompt=prompt,
-             mm_data_items=mm_data_items,
-             hf_processor_mm_kwargs=hf_processor_mm_kwargs,
-             tokenization_kwargs=tokenization_kwargs,
-             mm_uuids=mm_uuids,
-         )
-        self._codec_missing_indices = None
-
-        if is_update_applied:
-            return prompt_ids, mm_info, is_update_applied
-
-        tokenizer = self.info.get_tokenizer()
-        expanded_text = prompt if isinstance(prompt,
-                                             str) else tokenizer.decode(prompt_ids)
-
-        for modality in ("image", "video"):
-            if modality not in mm_info.prompt_updates:
-                continue
-            for item_updates in mm_info.prompt_updates[modality]:
-                if not item_updates:
-                    continue
-                update = item_updates[0]
-                target = update.target
-                replacement = update.content.full
-                if (not isinstance(target, str)
-                        or not isinstance(replacement, str)):
-                    return prompt_ids, mm_info, is_update_applied
-                if target not in expanded_text:
-                    return prompt_ids, mm_info, is_update_applied
-                expanded_text = expanded_text.replace(target, replacement, 1)
-
-        prompt_ids = tokenizer.encode(expanded_text, add_special_tokens=False)
-
-        return prompt_ids, mm_info, True
+            return apply_hf_processor_with_codec_cache(
+                self,
+                prompt=prompt,
+                mm_data_items=mm_data_items,
+                hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+                tokenization_kwargs=tokenization_kwargs,
+                mm_uuids=mm_uuids,
+            )
+        return apply_cached_prompt_updates(
+            self,
+            prompt,
+            prompt_ids,
+            mm_info,
+            is_update_applied,
+        )
 
     def _call_hf_processor(
         self,
@@ -974,13 +944,6 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo]
         tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         mm_data = dict(mm_data)
-        missing_idxs = getattr(self, "_codec_missing_indices", None)
-        codec_fi_orig = mm_kwargs.get("codec_frame_info")
-        n_images = len(mm_data.get("images", []))
-        if (missing_idxs is not None and codec_fi_orig is not None
-                and len(codec_fi_orig) > n_images):
-            filtered_codec = [codec_fi_orig[i] for i in missing_idxs]
-            mm_kwargs = {**mm_kwargs, "codec_frame_info": filtered_codec}
         mm_kwargs_clean = {k: v for k, v in mm_kwargs.items()
                           if k != "codec_frame_info"}
         codec_frame_info = mm_kwargs.get("codec_frame_info")
@@ -1054,16 +1017,17 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo]
         )
 
         if codec_frame_info is not None and _QWEN3VL_PRUNE_ENABLED:
+            codec_frame_info = normalize_codec_frame_info(
+                codec_frame_info, require_complete=True)
             grid_thw = combined_outputs.get("image_grid_thw")
             num_frames = len(codec_frame_info)
             merge_size = processor.image_processor.merge_size
 
-            anchor_idx = torch.tensor(
-                [f["anchor_idx"] for f in codec_frame_info],
-                dtype=torch.long)
+            is_anchor = torch.tensor(
+                [f["is_anchor"] for f in codec_frame_info], dtype=torch.bool)
 
-            prune_masks = []
-            proj_masks = []
+            patch_keep_masks = []
+            token_keep_masks = []
             kept_counts = []
             for i, f in enumerate(codec_frame_info):
                 if grid_thw is not None and i < len(grid_thw):
@@ -1078,41 +1042,44 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo]
                 mw = gw // merge_size
                 num_merged = mh * mw
 
-                client_mask = f.get("mask")
-                if client_mask is not None:
-                    client_1024 = torch.tensor(
-                        client_mask[1:], dtype=torch.bool)
-                    client_2d = client_1024.view(32, 32).float().unsqueeze(
-                        0).unsqueeze(0)
-                    resampled = F.interpolate(
-                        client_2d, size=(gh, gw),
-                        mode="nearest").squeeze(0).squeeze(0).bool()
-                    prune_masks.append(resampled.flatten())
-                else:
-                    prune_masks.append(torch.zeros(num_patches,
-                                                   dtype=torch.bool))
+                # Refuse resampling: Qwen's native-resolution grids are often
+                # non-square, and nearest-neighbor conversion can drop motion.
+                src_shape = f["patch_shape"]
+                client_flat = torch.tensor(
+                    f["patch_keep_mask"], dtype=torch.bool)
+                if tuple(src_shape) != (gh, gw):
+                    raise ValueError(
+                        "Qwen3-VL codec patch grid mismatch: client sent "
+                        f"{tuple(src_shape)}, processor produced {(gh, gw)}."
+                    )
+                if client_flat.numel() != num_patches:
+                    raise ValueError(
+                        "Qwen3-VL codec patch mask length mismatch: "
+                        f"got {client_flat.numel()}, expected {num_patches}"
+                    )
+                patch_keep_masks.append(client_flat)
 
-                client_proj = f.get("proj_mask")
-                if client_proj is not None:
-                    client_256 = torch.tensor(
-                        client_proj, dtype=torch.bool)
-                    client_2d = client_256.view(16, 16).float().unsqueeze(
-                        0).unsqueeze(0)
-                    resampled = F.interpolate(
-                        client_2d, size=(mh, mw),
-                        mode="nearest").squeeze(0).squeeze(0).bool()
-                    resampled_flat = resampled.flatten()
-                    proj_masks.append(resampled_flat)
-                    kept_counts.append(
-                        max(1, int(resampled_flat.sum().item())))
-                else:
-                    proj_masks.append(torch.zeros(num_merged,
-                                                  dtype=torch.bool))
-                    kept_counts.append(num_merged)
+                src_shape = f["token_shape"]
+                client_flat = torch.tensor(
+                    f["token_keep_mask"], dtype=torch.bool)
+                if tuple(src_shape) != (mh, mw):
+                    raise ValueError(
+                        "Qwen3-VL codec token grid mismatch: client sent "
+                        f"{tuple(src_shape)}, processor produced {(mh, mw)}."
+                    )
+                if client_flat.numel() != num_merged:
+                    raise ValueError(
+                        "Qwen3-VL codec token mask length mismatch: "
+                        f"got {client_flat.numel()}, expected {num_merged}"
+                    )
+                token_keep_masks.append(client_flat)
+                kept_counts.append(int(client_flat.sum().item()))
 
-            combined_outputs["codec_anchor_idx"] = anchor_idx
-            combined_outputs["codec_prune_mask"] = torch.stack(prune_masks)
-            combined_outputs["codec_proj_mask"] = torch.stack(proj_masks)
+            combined_outputs["codec_is_anchor"] = is_anchor
+            combined_outputs["codec_patch_keep_mask"] = torch.stack(
+                patch_keep_masks)
+            combined_outputs["codec_token_keep_mask"] = torch.stack(
+                token_keep_masks)
             combined_outputs["codec_kept_counts"] = torch.tensor(
                 kept_counts, dtype=torch.long)
 
@@ -1142,12 +1109,12 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo]
             video_grid_thw=MultiModalFieldConfig.batched("video"),
         )
 
-        if "codec_anchor_idx" in hf_inputs:
-            fields["codec_anchor_idx"] = MultiModalFieldConfig.batched(
+        if "codec_is_anchor" in hf_inputs:
+            fields["codec_is_anchor"] = MultiModalFieldConfig.batched(
                 "image")
-            fields["codec_prune_mask"] = MultiModalFieldConfig.batched(
+            fields["codec_patch_keep_mask"] = MultiModalFieldConfig.batched(
                 "image")
-            fields["codec_proj_mask"] = MultiModalFieldConfig.batched(
+            fields["codec_token_keep_mask"] = MultiModalFieldConfig.batched(
                 "image")
             fields["codec_kept_counts"] = MultiModalFieldConfig.batched(
                 "image")
@@ -1338,7 +1305,8 @@ class Qwen3LLMForCausalLM(Qwen3ForCausalLM):
                                         info=Qwen3VLProcessingInfo,
                                         dummy_inputs=Qwen3VLDummyInputsBuilder)
 class Qwen3VLForConditionalGeneration(nn.Module, SupportsMultiModal,
-                                      SupportsLoRA, SupportsPP,
+                                      SupportsCodecGuidedPruning, SupportsLoRA,
+                                      SupportsPP,
                                       SupportsMultiModalPruning):
     packed_modules_mapping = {
         "qkv_proj": [
@@ -1475,9 +1443,9 @@ class Qwen3VLForConditionalGeneration(nn.Module, SupportsMultiModal,
         image_embeds = kwargs.pop("image_embeds", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
 
-        codec_anchor_idx = kwargs.pop("codec_anchor_idx", None)
-        codec_prune_mask = kwargs.pop("codec_prune_mask", None)
-        codec_proj_mask = kwargs.pop("codec_proj_mask", None)
+        codec_is_anchor = kwargs.pop("codec_is_anchor", None)
+        codec_patch_keep_mask = kwargs.pop("codec_patch_keep_mask", None)
+        codec_token_keep_mask = kwargs.pop("codec_token_keep_mask", None)
         codec_kept_counts = kwargs.pop("codec_kept_counts", None)
 
         if pixel_values is None and image_embeds is None:
@@ -1512,13 +1480,15 @@ class Qwen3VLForConditionalGeneration(nn.Module, SupportsMultiModal,
                           image_embeds=image_embeds,
                           image_grid_thw=image_grid_thw)
 
-        if codec_anchor_idx is not None:
-            result["codec_anchor_idx"] = self._validate_and_reshape_mm_tensor(
-                codec_anchor_idx, "codec_anchor_idx")
-            result["codec_prune_mask"] = self._validate_and_reshape_mm_tensor(
-                codec_prune_mask, "codec_prune_mask")
-            result["codec_proj_mask"] = self._validate_and_reshape_mm_tensor(
-                codec_proj_mask, "codec_proj_mask")
+        if codec_is_anchor is not None:
+            result["codec_is_anchor"] = self._validate_and_reshape_mm_tensor(
+                codec_is_anchor, "codec_is_anchor")
+            result["codec_patch_keep_mask"] = (
+                self._validate_and_reshape_mm_tensor(
+                    codec_patch_keep_mask, "codec_patch_keep_mask"))
+            result["codec_token_keep_mask"] = (
+                self._validate_and_reshape_mm_tensor(
+                    codec_token_keep_mask, "codec_token_keep_mask"))
             result["codec_kept_counts"] = self._validate_and_reshape_mm_tensor(
                 codec_kept_counts, "codec_kept_counts")
 
@@ -1566,30 +1536,28 @@ class Qwen3VLForConditionalGeneration(nn.Module, SupportsMultiModal,
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _expand_prune_mask_to_merge_groups(
-        prune_mask: torch.Tensor,
+    def _expand_patch_keep_mask_to_merge_groups(
+        patch_keep_mask: torch.Tensor,
         grid_h: int,
         grid_w: int,
         merge_size: int = 2,
     ) -> torch.Tensor:
-        """Expand a per-patch prune mask so that all patches in a spatial
-        merge group are included if *any* patch in that group is dynamic.
+        """Expand a patch keep mask to complete spatial merge groups.
 
         Args:
-            prune_mask: bool [H*W], True = static (prunable).
+            patch_keep_mask: bool [H*W], True = keep.
             grid_h, grid_w: spatial grid dimensions.
             merge_size: spatial merge factor (default 2).
 
         Returns:
             encode_mask: bool [H*W], True = include in sparse ViT.
         """
-        dynamic = ~prune_mask
-        dynamic_2d = dynamic.view(grid_h, grid_w)
-        groups = dynamic_2d.view(
+        keep_2d = patch_keep_mask.view(grid_h, grid_w)
+        groups = keep_2d.view(
             grid_h // merge_size, merge_size,
             grid_w // merge_size, merge_size)
-        group_has_dynamic = groups.any(dim=(1, 3))
-        expanded = group_has_dynamic.unsqueeze(1).expand(
+        group_is_kept = groups.any(dim=(1, 3))
+        expanded = group_is_kept.unsqueeze(1).expand(
             -1, merge_size, -1).unsqueeze(3).expand(
                 -1, -1, -1, merge_size)
         encode_mask = expanded.reshape(grid_h, grid_w).flatten()
@@ -1638,9 +1606,9 @@ class Qwen3VLForConditionalGeneration(nn.Module, SupportsMultiModal,
         self,
         pixel_values: torch.Tensor,
         grid_thw_list: list[list[int]],
-        codec_anchor_idx: torch.Tensor,
-        codec_prune_mask: torch.Tensor,
-        codec_proj_mask: torch.Tensor,
+        codec_is_anchor: torch.Tensor,
+        codec_patch_keep_mask: torch.Tensor,
+        codec_token_keep_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
         """Codec-driven sparse ViT encoding.
 
@@ -1653,13 +1621,12 @@ class Qwen3VLForConditionalGeneration(nn.Module, SupportsMultiModal,
         device = pixel_values.device
         count = len(grid_thw_list)
 
-        if codec_prune_mask.dim() > 2:
-            codec_prune_mask = codec_prune_mask.reshape(count, -1)
-        if codec_proj_mask.dim() > 2:
-            codec_proj_mask = codec_proj_mask.reshape(count, -1)
+        if codec_patch_keep_mask.dim() > 2:
+            codec_patch_keep_mask = codec_patch_keep_mask.reshape(count, -1)
+        if codec_token_keep_mask.dim() > 2:
+            codec_token_keep_mask = codec_token_keep_mask.reshape(count, -1)
 
-        is_i_frame = [not codec_prune_mask[fi].any().item()
-                      for fi in range(count)]
+        is_i_frame = [bool(codec_is_anchor[fi].item()) for fi in range(count)]
         merge_unit = merge_size * merge_size
 
         pv_sizes = [int(g[0] * g[1] * g[2]) for g in grid_thw_list]
@@ -1673,14 +1640,14 @@ class Qwen3VLForConditionalGeneration(nn.Module, SupportsMultiModal,
                 keep_indices.append(None)
             else:
                 _, gh, gw = grid_thw_list[fi]
-                mask = codec_prune_mask[fi, :gh * gw]
+                mask = codec_patch_keep_mask[fi, :gh * gw]
                 encode_masks.append(
-                    self._expand_prune_mask_to_merge_groups(
+                    self._expand_patch_keep_mask_to_merge_groups(
                         mask, gh, gw, merge_size))
                 mh = gh // merge_size
                 mw = gw // merge_size
                 n_merged = mh * mw
-                keep_idx = codec_proj_mask[fi, :n_merged].nonzero(
+                keep_idx = codec_token_keep_mask[fi, :n_merged].nonzero(
                     as_tuple=False).squeeze(-1)
                 if keep_idx.numel() == 0:
                     keep_idx = torch.zeros(1, dtype=torch.long, device=device)
@@ -1726,6 +1693,15 @@ class Qwen3VLForConditionalGeneration(nn.Module, SupportsMultiModal,
                 rope_parts.append(frame_rope)
             else:
                 em = encode_masks[fi]
+                if not bool(em.any()):
+                    # A frame whose every patch reads as static prunes to nothing,
+                    # and an empty frame propagates to `cat_patches.reshape(0, -1)`,
+                    # which is ambiguous and kills the engine. Keep one patch so the
+                    # frame still contributes a token. This became reachable once the
+                    # mask was pooled onto the model's real (finer, non-square) grid;
+                    # the old square path happened not to hit it.
+                    em = em.clone()
+                    em[0] = True
                 selected = frame_pv[em]
                 k = selected.size(0)
                 all_patches.append(selected)
@@ -1853,7 +1829,7 @@ class Qwen3VLForConditionalGeneration(nn.Module, SupportsMultiModal,
         assert grid_thw.ndim == 2
         grid_thw_list = grid_thw.tolist()
 
-        has_codec = ("codec_anchor_idx" in image_input
+        has_codec = ("codec_is_anchor" in image_input
                      and _QWEN3VL_PRUNE_ENABLED)
 
         if image_input["type"] == "image_embeds":
@@ -1863,9 +1839,9 @@ class Qwen3VLForConditionalGeneration(nn.Module, SupportsMultiModal,
             return self._prune_with_codec(
                 pixel_values,
                 grid_thw_list,
-                image_input["codec_anchor_idx"],
-                image_input["codec_prune_mask"],
-                image_input["codec_proj_mask"],
+                image_input["codec_is_anchor"],
+                image_input["codec_patch_keep_mask"],
+                image_input["codec_token_keep_mask"],
             )
         else:
             pixel_values = image_input["pixel_values"].type(self.visual.dtype)
@@ -1963,7 +1939,7 @@ class Qwen3VLForConditionalGeneration(nn.Module, SupportsMultiModal,
         for modality in mm_input_by_modality:
             multimodal_input = mm_input_by_modality[modality]
             if modality == "image":
-                has_codec = ("codec_anchor_idx" in multimodal_input
+                has_codec = ("codec_is_anchor" in multimodal_input
                              and _QWEN3VL_PRUNE_ENABLED)
                 vision_embeddings = self._process_image_input(multimodal_input)
                 if self.is_multimodal_pruning_enabled and not has_codec:

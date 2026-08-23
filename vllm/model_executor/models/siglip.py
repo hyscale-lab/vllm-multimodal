@@ -194,6 +194,20 @@ class SiglipAttention(nn.Module):
 
         return attn_output, None
 
+    def forward_packed(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> tuple[torch.Tensor, None]:
+        qkv_states, _ = self.qkv_proj(hidden_states)
+        query_states, key_states, value_states = qkv_states.chunk(3, dim=-1)
+
+        out = self.attn.forward_packed(query_states, key_states, value_states,
+                                       cu_seqlens, max_seqlen)
+        attn_output, _ = self.out_proj(out)
+        return attn_output, None
+
 
 class SiglipMLP(nn.Module):
 
@@ -281,6 +295,26 @@ class SiglipEncoderLayer(nn.Module):
 
         return hidden_states, None
 
+    def forward_packed(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> tuple[torch.Tensor, None]:
+        residual = hidden_states
+
+        hidden_states = self.layer_norm1(hidden_states)
+        hidden_states, _ = self.self_attn.forward_packed(
+            hidden_states, cu_seqlens, max_seqlen)
+        hidden_states += residual
+
+        residual = hidden_states
+        hidden_states = self.layer_norm2(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states += residual
+
+        return hidden_states, None
+
 
 class SiglipEncoder(nn.Module):
 
@@ -321,6 +355,25 @@ class SiglipEncoder(nn.Module):
                 hidden_states_pool.append(hidden_states)
         # If we have multiple feature sample layers, we return all hidden
         # states in order and grab the ones we need by index.
+        if return_all_hidden_states:
+            return hidden_states_pool
+        return hidden_states
+
+    def forward_packed(
+        self,
+        inputs_embeds: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        return_all_hidden_states: bool,
+    ) -> Union[torch.Tensor, list[torch.Tensor]]:
+        hidden_states_pool = [inputs_embeds]
+        hidden_states = inputs_embeds
+
+        for encoder_layer in self.layers:
+            hidden_states, _ = encoder_layer.forward_packed(
+                hidden_states, cu_seqlens, max_seqlen)
+            if return_all_hidden_states:
+                hidden_states_pool.append(hidden_states)
         if return_all_hidden_states:
             return hidden_states_pool
         return hidden_states
@@ -444,6 +497,24 @@ class SiglipVisionTransformer(nn.Module):
 
         return encoder_outputs
 
+    def forward_packed(
+        self,
+        inputs_embeds: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        feature_sample_layers: Optional[list[int]] = None,
+    ) -> torch.Tensor:
+        return_all_hidden_states = feature_sample_layers is not None
+        encoder_outputs = self.encoder.forward_packed(
+            inputs_embeds,
+            cu_seqlens,
+            max_seqlen,
+            return_all_hidden_states,
+        )
+        return resolve_visual_encoder_outputs(
+            encoder_outputs, feature_sample_layers, self.post_layernorm,
+            self.config.num_hidden_layers)
+
 
 class SiglipVisionModel(nn.Module):
     config_class = SiglipVisionConfig
@@ -480,6 +551,20 @@ class SiglipVisionModel(nn.Module):
         return self.vision_model(
             pixel_values=pixel_values,
             interpolate_pos_encoding=interpolate_pos_encoding,
+            feature_sample_layers=feature_sample_layers,
+        )
+
+    def forward_packed(
+        self,
+        inputs_embeds: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        feature_sample_layers: Optional[list[int]] = None,
+    ) -> torch.Tensor:
+        return self.vision_model.forward_packed(
+            inputs_embeds=inputs_embeds,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
             feature_sample_layers=feature_sample_layers,
         )
 

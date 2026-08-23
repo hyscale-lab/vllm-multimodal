@@ -239,16 +239,32 @@ def recompute_mrope_positions(
             else:
                 # We have completed previous mm_embedding part and
                 # ready to start a new one
-                next_vision_start_token = vision_start_indices[
-                    vision_start_indices >= num_computed_tokens][0]
-                mm_embeddings_seen = 0
-                global_mm_start = next_vision_start_token
+                future_starts = vision_start_indices[
+                    vision_start_indices >= num_computed_tokens]
+                if len(future_starts):
+                    mm_embeddings_seen = 0
+                    global_mm_start = future_starts[0]
+                else:
+                    # The chunk can end exactly after the final vision-start
+                    # token, before any of that media's (possibly pruned)
+                    # placeholder tokens. There is no *next* start in this
+                    # case: mm_pos belongs to the final media and zero of its
+                    # embeddings have been consumed. The old unconditional
+                    # [0] indexed an empty tensor and killed EngineCore.
+                    mm_embeddings_seen = 0
+                    global_mm_start = last_vision_start_token
 
         else:
             # If there were no vision start indexes so far,
             # let's find first vision start index
-            next_vision_start_token = vision_start_indices[
-                vision_start_indices >= num_computed_tokens][0]
+            future_starts = vision_start_indices[
+                vision_start_indices >= num_computed_tokens]
+            if not len(future_starts):
+                raise RuntimeError(
+                    "Multimodal positions were supplied without a matching "
+                    "vision-start token at or after num_computed_tokens."
+                )
+            next_vision_start_token = future_starts[0]
 
             mm_embeddings_seen = 0
             global_mm_start = next_vision_start_token
